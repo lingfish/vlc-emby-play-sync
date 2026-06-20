@@ -681,8 +681,8 @@ end
 
 local function resolve_user_id()
   if cfg.user_id == "" then return end
-  -- already a UUID (36 chars with hyphens, hex only)
-  if cfg.user_id:match("^[%x%-]+$") and #cfg.user_id == 36 then
+  -- already a UUID (32 hex chars or 36 with hyphens)
+  if cfg.user_id:match("^[%x%-]+$") and (#cfg.user_id == 32 or #cfg.user_id == 36) then
     return
   end
   dmsg("resolving username '%s' to UUID via /Users", cfg.user_id)
