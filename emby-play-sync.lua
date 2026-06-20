@@ -431,7 +431,7 @@ local function emby_find_item(filepath)
   if code and code >= 200 and code < 300 and resp then
     local ok, data = pcall(json_decode, resp)
     if ok and data and data.Items and #data.Items > 0 then
-      dmsg("matched item by path: %s (%s)", data.Items[1].Name, data.Items[1].Id)
+      dmsg("matched item by path: %s (id=%s type=%s)", data.Items[1].Name, data.Items[1].Id, type(data.Items[1].Id))
       osd("Emby: matched " .. data.Items[1].Name)
       return data.Items[1]
     end
@@ -543,7 +543,8 @@ local function emby_play_start(item)
     PlayMethod = "DirectPlay",
     PlaySessionId = state.play_session_id
   }
-  local code, _ = emby_request("POST", "/emby/Sessions/Playing", json_encode(payload))
+  local spath = "/emby/Sessions/Playing?userId=" .. url_encode(cfg.user_id)
+  local code, _ = emby_request("POST", spath, json_encode(payload))
   if code and code >= 200 and code < 300 then
     state.playing = true
     state.last_sync = os.time()
@@ -570,7 +571,8 @@ local function emby_play_progress(event_name)
     PlaySessionId = state.play_session_id,
     EventName = event_name
   }
-  local code, _ = emby_request("POST", "/emby/Sessions/Playing/Progress", json_encode(payload))
+  local spath = "/emby/Sessions/Playing/Progress?userId=" .. url_encode(cfg.user_id)
+  local code, _ = emby_request("POST", spath, json_encode(payload))
   if code and code >= 200 and code < 300 then
     state.last_sync = os.time()
     dmsg("progress: %s -> %d ticks", event_name, ticks)
@@ -586,9 +588,11 @@ local function emby_play_stop()
     ItemId = state.item_id,
     MediaSourceId = state.media_source_id or state.item_id,
     PositionTicks = ticks,
-    PlaySessionId = state.play_session_id
+    PlaySessionId = state.play_session_id,
+    Failed = false
   }
-  local code, _ = emby_request("POST", "/emby/Sessions/Playing/Stopped", json_encode(payload))
+  local spath = "/emby/Sessions/Playing/Stopped?userId=" .. url_encode(cfg.user_id)
+  local code, _ = emby_request("POST", spath, json_encode(payload))
   if code and code >= 200 and code < 300 then
     dmsg("playback stopped at %d ticks", ticks)
   else
