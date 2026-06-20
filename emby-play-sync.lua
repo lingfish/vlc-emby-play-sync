@@ -469,28 +469,26 @@ local function generate_session_id()
 end
 
 local function get_position_ticks()
-  -- try vlc.input.time() — returns microseconds
-  if vlc.input and vlc.input.time then
-    local ok, time_us = pcall(vlc.input.time)
-    if ok then
-      dmsg("pcall vlc.input.time() -> %s", tostring(time_us))
-      if time_us and time_us > 0 then
-        return math.floor(time_us * 10)
-      end
-    else
-      dmsg("pcall vlc.input.time() error: %s", tostring(time_us))
+  dmsg("vlc.input type=%s", type(vlc.input))
+  if vlc.input then
+    local keys = {}
+    for k in pairs(vlc.input) do keys[#keys+1] = tostring(k) end
+    dmsg("vlc.input keys: %s", table.concat(keys, ","))
+
+    local mt = getmetatable(vlc.input)
+    dmsg("vlc.input metatable: %s", mt and tostring(mt) or "nil")
+    if mt then
+      local mtkeys = {}
+      for k in pairs(mt) do mtkeys[#mtkeys+1] = tostring(k) end
+      dmsg("vlc.input mt keys: %s", table.concat(mtkeys, ","))
     end
+
+    dmsg("vlc.input.time exists=%s type=%s", tostring(vlc.input.time ~= nil), type(vlc.input.time))
+    dmsg("vlc.input.item exists=%s type=%s", tostring(vlc.input.item ~= nil), type(vlc.input.item))
+    dmsg("vlc.input.length exists=%s type=%s", tostring(vlc.input.length ~= nil), type(vlc.input.length))
+    dmsg("vlc.input.position exists=%s type=%s", tostring(vlc.input.position ~= nil), type(vlc.input.position))
+    dmsg("vlc.input.state exists=%s type=%s", tostring(vlc.input.state ~= nil), type(vlc.input.state))
   end
-  -- try vlc.input.length() * vlc.input.position()  (also µs)
-  if vlc.input and vlc.input.length and vlc.input.position then
-    local ok_len, len = pcall(vlc.input.length)
-    local ok_pos, pos = pcall(vlc.input.position)
-    if ok_len and ok_pos and len and len > 0 and pos and pos > 0 then
-      dmsg("fallback: len=%s pos=%s", tostring(len), tostring(pos))
-      return math.floor(len * pos * 10)
-    end
-  end
-  dmsg("get_position_ticks: returning 0")
   return 0
 end
 
