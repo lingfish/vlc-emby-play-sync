@@ -374,6 +374,9 @@ local function emby_request(method, spath, body)
   end
 
   dmsg("emby %s %s -> %d (%d bytes)", method, spath, status_code or 0, #body_part)
+  if status_code and status_code >= 400 then
+    derr("emby error response: %s", body_part)
+  end
   return status_code, body_part
 end
 
@@ -390,9 +393,9 @@ local function emby_find_item(filepath)
     return nil
   end
 
-  -- try exact path match
+  -- try exact path match via /Items endpoint
   local encoded = url_encode(filepath)
-  local spath = "/emby/Users/" .. cfg.user_id .. "/Items?Recursive=true&Filters=IsNotFolder&Path=" .. encoded
+  local spath = "/emby/Items?UserId=" .. url_encode(cfg.user_id) .. "&Recursive=true&Path=" .. encoded
   local code, resp = emby_request("GET", spath, nil)
   if code and code >= 200 and code < 300 and resp then
     local ok, data = pcall(json_decode, resp)
@@ -403,18 +406,19 @@ local function emby_find_item(filepath)
     end
   end
 
-  -- fallback: filename search
+  -- fallback: filename search via /Search/Hints
   local filename = filepath:match("[^/\\]+$")
   if filename then
     local encoded_name = url_encode(filename)
-    spath = "/emby/Users/" .. cfg.user_id .. "/Items?Recursive=true&Filters=IsNotFolder&SearchTerm=" .. encoded_name
+    spath = "/emby/Search/Hints?UserId=" .. url_encode(cfg.user_id) .. "&SearchTerm=" .. encoded_name .. "&Limit=1&IncludeMedia=true"
     code, resp = emby_request("GET", spath, nil)
     if code and code >= 200 and code < 300 and resp then
       local ok, data = pcall(json_decode, resp)
-      if ok and data and data.Items and #data.Items > 0 then
-        dmsg("matched item by filename: %s (%s)", data.Items[1].Name, data.Items[1].Id)
-        osd("Emby: matched " .. data.Items[1].Name)
-        return data.Items[1]
+      if ok and data and data.SearchHints and #data.SearchHints > 0 then
+        local hint = data.SearchHints[1]
+        dmsg("matched item by filename: %s (%s)", hint.Name, hint.ItemId)
+        osd("Emby: matched " .. hint.Name)
+        return { Id = hint.ItemId, Name = hint.Name }
       end
     end
   end
