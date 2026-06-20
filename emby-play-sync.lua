@@ -492,17 +492,17 @@ local function get_current_uri()
 end
 
 local function get_playback_status()
+  if vlc.playlist and vlc.playlist.status then
+    local st = vlc.playlist.status()
+    if st and st ~= "" then return st end
+  end
   if vlc.object and vlc.object.input then
     local input_obj = vlc.object.input()
     if input_obj then
       local st = vlc.var.get(input_obj, "state")
       if st == 3 then return "playing"
-      elseif st == 4 then return "paused"
-      elseif st then return "stopped" end
+      elseif st == 4 then return "paused" end
     end
-  end
-  if vlc.playlist and vlc.playlist.status then
-    return vlc.playlist.status() or ""
   end
   return ""
 end
