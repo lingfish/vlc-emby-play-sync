@@ -251,7 +251,11 @@ end
 
 local function parse_url(url)
   local parsed = vlc.strings.url_parse(url)
-  return parsed["host"], parsed["port"] or "8096", parsed["path"]
+  local path = parsed["path"] or "/"
+  if parsed["option"] and parsed["option"] ~= "" then
+    path = path .. "?" .. parsed["option"]
+  end
+  return parsed["host"], parsed["port"] or "8096", path
 end
 
 local function emby_request(method, spath, body)
@@ -375,9 +379,14 @@ end
 
 -- Emby API helpers
 
+local function osd(msg)
+  pcall(vlc.osd.message, msg)
+end
+
 local function emby_find_item(filepath)
   if cfg.user_id == "" then
     dwarn("no user_id configured, cannot search for items")
+    osd("Emby: User ID not configured")
     return nil
   end
 
@@ -389,6 +398,7 @@ local function emby_find_item(filepath)
     local ok, data = pcall(json_decode, resp)
     if ok and data and data.Items and #data.Items > 0 then
       dmsg("matched item by path: %s (%s)", data.Items[1].Name, data.Items[1].Id)
+      osd("Emby: matched " .. data.Items[1].Name)
       return data.Items[1]
     end
   end
@@ -403,12 +413,14 @@ local function emby_find_item(filepath)
       local ok, data = pcall(json_decode, resp)
       if ok and data and data.Items and #data.Items > 0 then
         dmsg("matched item by filename: %s (%s)", data.Items[1].Name, data.Items[1].Id)
+        osd("Emby: matched " .. data.Items[1].Name)
         return data.Items[1]
       end
     end
   end
 
   dwarn("no emby item found for: %s", filepath)
+  osd("Emby: no match for this file")
   return nil
 end
 
@@ -650,6 +662,8 @@ function input_changed()
     emby_play_start({ Id = state.item_id, Name = uri:match("[^/\\]+$") or uri })
   end
 end
+
+function meta_changed() end
 
 function playing_changed()
   local st = get_playback_status()
