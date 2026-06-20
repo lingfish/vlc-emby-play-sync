@@ -409,9 +409,11 @@ local function emby_find_item(filepath)
   -- fallback: filename search via /Search/Hints
   local filename = filepath:match("[^/\\]+$")
   if filename then
-    local encoded_name = url_encode(filename)
+    local name_no_ext = filename:gsub("%.[^%.]+$", "")
+    local encoded_name = url_encode(name_no_ext)
     spath = "/emby/Search/Hints?UserId=" .. url_encode(cfg.user_id) .. "&SearchTerm=" .. encoded_name .. "&Limit=1&IncludeMedia=true"
     code, resp = emby_request("GET", spath, nil)
+    dmsg("search hints response: %d bytes", resp and #resp or 0)
     if code and code >= 200 and code < 300 and resp then
       local ok, data = pcall(json_decode, resp)
       if ok and data and data.SearchHints and #data.SearchHints > 0 then
@@ -614,12 +616,39 @@ function descriptor()
   }
 end
 
+local function resolve_user_id()
+  if cfg.user_id == "" then return end
+  -- already a UUID (36 chars with hyphens, hex only)
+  if cfg.user_id:match("^[%x%-]+$") and #cfg.user_id == 36 then
+    return
+  end
+  dmsg("resolving username '%s' to UUID via /Users", cfg.user_id)
+  local code, resp = emby_request("GET", "/emby/Users", nil)
+  if code and code >= 200 and code < 300 and resp then
+    local ok, users = pcall(json_decode, resp)
+    if ok and type(users) == "table" then
+      for _, user in ipairs(users) do
+        if user.Name == cfg.user_id then
+          cfg.user_id = user.Id
+          save_config()
+          dmsg("resolved user '%s' to UUID: %s", user.Name, user.Id)
+          return
+        end
+      end
+      dwarn("no user found with name '%s'", cfg.user_id)
+    end
+  else
+    dwarn("failed to fetch users, cannot resolve username")
+  end
+end
+
 function activate()
   dmsg("activating extension v%s", EXT_VERSION)
   math.randomseed(os.time())
   load_config()
   if cfg.server_url ~= "" then
     dmsg("configured for: %s", cfg.server_url)
+    resolve_user_id()
   else
     dwarn("no configuration found — use Configure menu to set up Emby server")
   end
