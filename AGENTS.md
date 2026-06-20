@@ -1,4 +1,4 @@
-# vlc-play-sync
+# vlc-emby-play-sync
 
 VLC Lua extension that syncs current playback position (resume point) to Emby server.
 
