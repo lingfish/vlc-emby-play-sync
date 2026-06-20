@@ -469,33 +469,13 @@ local function generate_session_id()
 end
 
 local function get_position_ticks()
-  -- try vlc.object.input() + vlc.var.get
   if vlc.object and vlc.object.input then
     local input_obj = vlc.object.input()
     if input_obj then
-      dmsg("vlc.object.input() works, type=%s", type(input_obj))
       local time_us = vlc.var.get(input_obj, "time")
       if time_us and time_us > 0 then
         return math.floor(time_us * 10)
       end
-      dmsg("vlc.var.get time=%s", tostring(time_us))
-    else
-      dmsg("vlc.object.input() returned nil")
-    end
-  end
-  -- try input item methods
-  if vlc.input and vlc.input.item then
-    local item = vlc.input.item()
-    if item then
-      local mt = getmetatable(item)
-      dmsg("input item metatable: %s", mt and tostring(mt) or "nil")
-      if mt then
-        local keys = {}
-        for k in pairs(mt) do keys[#keys+1] = tostring(k) end
-        dmsg("input item mt keys: %s", table.concat(keys, ","))
-      end
-      local ok, dur = pcall(item.duration, item)
-      dmsg("item:duration() ok=%s val=%s", tostring(ok), tostring(dur))
     end
   end
   return 0
@@ -512,11 +492,14 @@ local function get_current_uri()
 end
 
 local function get_playback_status()
-  if vlc.input and vlc.input.state then
-    local st = vlc.input.state()
-    if st == 3 then return "playing"
-    elseif st == 4 then return "paused"
-    elseif st then return "stopped" end
+  if vlc.object and vlc.object.input then
+    local input_obj = vlc.object.input()
+    if input_obj then
+      local st = vlc.var.get(input_obj, "state")
+      if st == 3 then return "playing"
+      elseif st == 4 then return "paused"
+      elseif st then return "stopped" end
+    end
   end
   if vlc.playlist and vlc.playlist.status then
     return vlc.playlist.status() or ""
@@ -703,17 +686,7 @@ function activate()
   dmsg("activating extension v%s", EXT_VERSION)
   math.randomseed(os.time())
   load_config()
-  local modules = {"vlc.object", "vlc.var", "vlc.playlist", "vlc.input"}
-  for _, mname in ipairs(modules) do
-    local m = _G
-    for part in mname:gmatch("[%w_]+") do m = m and m[part] end
-    dmsg("%s type=%s", mname, type(m))
-    if type(m) == "table" then
-      local keys = {}
-      for k in pairs(m) do keys[#keys+1] = tostring(k) end
-      dmsg("%s keys: %s", mname, table.concat(keys, ","))
-    end
-  end
+
   if cfg.server_url ~= "" then
     dmsg("configured for: %s", cfg.server_url)
     resolve_user_id()
