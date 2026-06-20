@@ -40,60 +40,6 @@ local function url_encode(s)
   end)
 end
 
--- Config persistence via file in VLC config dir
-local function config_path()
-  local userdata = vlc.config.userdatadir()
-  if not userdata then return nil end
-  return userdata .. "/emby_play_sync.json"
-end
-
-local function load_config()
-  local path = config_path()
-  if not path then
-    dmsg("no user data dir, cannot load config")
-    return
-  end
-  local f = vlc.io.open(path, "rb")
-  if not f then
-    dmsg("no config file at %s", path)
-    return
-  end
-  local data = f:read("*all")
-  f:close()
-  if data and data ~= "" then
-    local ok, parsed = pcall(json_decode, data)
-    if ok and parsed then
-      cfg.server_url = parsed.server_url or ""
-      cfg.api_key = parsed.api_key or ""
-      cfg.user_id = parsed.user_id or ""
-      dmsg("config loaded from %s", path)
-      return
-    end
-  end
-  dmsg("empty or invalid config file")
-end
-
-local function save_config()
-  local path = config_path()
-  if not path then
-    derr("no user data dir, cannot save config")
-    return
-  end
-  local ok, encoded = pcall(json_encode, cfg)
-  if not ok then
-    derr("failed to encode config")
-    return
-  end
-  local f = vlc.io.open(path, "wb")
-  if not f then
-    derr("cannot write config to %s", path)
-    return
-  end
-  f:write(encoded)
-  f:close()
-  dmsg("config saved to %s", path)
-end
-
 -- JSON helpers
 
 local function json_decode(s)
@@ -240,6 +186,60 @@ local function json_encode(v)
   else
     return '"' .. tostring(v) .. '"'
   end
+end
+
+-- Config persistence via file in VLC config dir
+local function config_path()
+  local userdata = vlc.config.userdatadir()
+  if not userdata then return nil end
+  return userdata .. "/emby_play_sync.json"
+end
+
+local function load_config()
+  local path = config_path()
+  if not path then
+    dmsg("no user data dir, cannot load config")
+    return
+  end
+  local f = vlc.io.open(path, "rb")
+  if not f then
+    dmsg("no config file at %s", path)
+    return
+  end
+  local data = f:read("*all")
+  f:close()
+  if data and data ~= "" then
+    local ok, parsed = pcall(json_decode, data)
+    if ok and parsed then
+      cfg.server_url = parsed.server_url or ""
+      cfg.api_key = parsed.api_key or ""
+      cfg.user_id = parsed.user_id or ""
+      dmsg("config loaded from %s", path)
+      return
+    end
+  end
+  dmsg("empty or invalid config file")
+end
+
+local function save_config()
+  local path = config_path()
+  if not path then
+    derr("no user data dir, cannot save config")
+    return
+  end
+  local ok, encoded = pcall(json_encode, cfg)
+  if not ok then
+    derr("failed to encode config")
+    return
+  end
+  local f = vlc.io.open(path, "wb")
+  if not f then
+    derr("cannot write config to %s", path)
+    return
+  end
+  f:write(encoded)
+  f:close()
+  dmsg("config saved to %s", path)
 end
 
 -- HTTP client via vlc.net
@@ -651,7 +651,7 @@ function input_changed()
   end
 end
 
-function status_changed()
+function playing_changed()
   local st = get_playback_status()
   dmsg("status changed: %s -> %s", state.last_status, st)
 
