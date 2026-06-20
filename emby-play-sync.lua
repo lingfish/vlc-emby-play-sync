@@ -576,6 +576,9 @@ local function emby_play_progress(event_name)
   if code and code >= 200 and code < 300 then
     state.last_sync = os.time()
     dmsg("progress: %s -> %d ticks", event_name, ticks)
+    if event_name == "Pause" or event_name == "TimeUpdate" then
+      emby_save_position(ticks)
+    end
   else
     dwarn("progress failed: %s", tostring(code))
   end
@@ -595,11 +598,27 @@ local function emby_play_stop()
   local code, _ = emby_request("POST", spath, json_encode(payload))
   if code and code >= 200 and code < 300 then
     dmsg("playback stopped at %d ticks", ticks)
+    emby_save_position(ticks)
   else
     dwarn("stop failed: %s", tostring(code))
   end
   state.playing = false
   state.play_session_id = nil
+end
+
+local function emby_save_position(ticks)
+  if not state.item_id or cfg.user_id == "" then return end
+  local payload = {
+    PlaybackPositionTicks = ticks,
+    Played = false
+  }
+  local spath = "/emby/Users/" .. url_encode(cfg.user_id) .. "/Items/" .. url_encode(state.item_id) .. "/UserData"
+  local code, resp = emby_request("POST", spath, json_encode(payload))
+  if code and code >= 200 and code < 300 then
+    dmsg("position saved: %d ticks", ticks)
+  else
+    dwarn("position save failed: %s body=%s", tostring(code), tostring(resp))
+  end
 end
 
 local function match_and_cache()
