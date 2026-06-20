@@ -1,11 +1,16 @@
 # vlc-emby-play-sync
 
+![VLC 3.x](https://img.shields.io/badge/VLC-3.x-orange)
+![Lua 5.1](https://img.shields.io/badge/Lua-5.1-blue)
+![Emby 4.x](https://img.shields.io/badge/Emby-4.x-green)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-donate-ffdd00?logo=buymeacoffee)](https://buymeacoffee.com/lingfish)
+
 VLC Lua extension that syncs playback position to Emby as a resume point.
 
 ## Installation
 
 ```bash
-git clone https://github.com/jason/vlc-emby-play-sync
+git clone https://github.com/lingfish/vlc-emby-play-sync
 cd vlc-emby-play-sync
 ./install.sh
 ```
@@ -44,3 +49,9 @@ Path prefixes let VLC find the right Emby item when the file path differs (e.g. 
 | `emby-play-sync.lua` | VLC Lua extension (single file) |
 | `install.sh` | Symlinks extension into `~/.local/share/vlc/lua/extensions/` |
 | `AGENTS.md` | Architecture notes for AI coding assistants |
+
+## Support
+
+If this extension helps you, consider buying me a coffee:
+
+[![Buy Me a Coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/lingfish)
