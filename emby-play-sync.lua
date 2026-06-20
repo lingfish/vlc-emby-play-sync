@@ -469,12 +469,28 @@ local function generate_session_id()
 end
 
 local function get_position_ticks()
+  -- try vlc.input.time() — returns microseconds
   if vlc.input and vlc.input.time then
-    local time_us = vlc.input.time()
-    if time_us then
-      return math.floor(time_us * 10)
+    local ok, time_us = pcall(vlc.input.time)
+    if ok then
+      dmsg("pcall vlc.input.time() -> %s", tostring(time_us))
+      if time_us and time_us > 0 then
+        return math.floor(time_us * 10)
+      end
+    else
+      dmsg("pcall vlc.input.time() error: %s", tostring(time_us))
     end
   end
+  -- try vlc.input.length() * vlc.input.position()  (also µs)
+  if vlc.input and vlc.input.length and vlc.input.position then
+    local ok_len, len = pcall(vlc.input.length)
+    local ok_pos, pos = pcall(vlc.input.position)
+    if ok_len and ok_pos and len and len > 0 and pos and pos > 0 then
+      dmsg("fallback: len=%s pos=%s", tostring(len), tostring(pos))
+      return math.floor(len * pos * 10)
+    end
+  end
+  dmsg("get_position_ticks: returning 0")
   return 0
 end
 
@@ -680,6 +696,13 @@ function activate()
   dmsg("activating extension v%s", EXT_VERSION)
   math.randomseed(os.time())
   load_config()
+  if vlc.input then
+    local methods = {}
+    for k in pairs(vlc.input) do methods[#methods+1] = tostring(k) end
+    dmsg("vlc.input methods: %s", table.concat(methods, ", "))
+  else
+    dmsg("vlc.input is nil")
+  end
   if cfg.server_url ~= "" then
     dmsg("configured for: %s", cfg.server_url)
     resolve_user_id()
