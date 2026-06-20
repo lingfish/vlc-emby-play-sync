@@ -525,6 +525,21 @@ local function get_local_path(uri)
   return vlc.strings.decode_uri(uri:match("^file://(.+)$") or uri)
 end
 
+local function emby_save_position(ticks)
+  if not state.item_id or cfg.user_id == "" then return end
+  local payload = {
+    PlaybackPositionTicks = ticks,
+    Played = false
+  }
+  local spath = "/emby/Users/" .. url_encode(cfg.user_id) .. "/Items/" .. url_encode(state.item_id) .. "/UserData"
+  local code, resp = emby_request("POST", spath, json_encode(payload))
+  if code and code >= 200 and code < 300 then
+    dmsg("position saved: %d ticks", ticks)
+  else
+    dwarn("position save failed: %s body=%s", tostring(code), tostring(resp))
+  end
+end
+
 -- Emby session lifecycle
 
 local function emby_play_start(item)
@@ -604,21 +619,6 @@ local function emby_play_stop()
   end
   state.playing = false
   state.play_session_id = nil
-end
-
-local function emby_save_position(ticks)
-  if not state.item_id or cfg.user_id == "" then return end
-  local payload = {
-    PlaybackPositionTicks = ticks,
-    Played = false
-  }
-  local spath = "/emby/Users/" .. url_encode(cfg.user_id) .. "/Items/" .. url_encode(state.item_id) .. "/UserData"
-  local code, resp = emby_request("POST", spath, json_encode(payload))
-  if code and code >= 200 and code < 300 then
-    dmsg("position saved: %d ticks", ticks)
-  else
-    dwarn("position save failed: %s body=%s", tostring(code), tostring(resp))
-  end
 end
 
 local function match_and_cache()
