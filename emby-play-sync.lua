@@ -464,8 +464,8 @@ local function emby_find_item(filepath)
 end
 
 local function generate_session_id()
-  local t = tostring(os.time() * 1000000)
-  return "vlc-" .. t .. "-" .. tostring(math.random(10000, 99999))
+  local t = math.floor(os.time() * 1000000)
+  return string.format("vlc-%d-%d", t, math.random(10000, 99999))
 end
 
 local function get_position_ticks()
@@ -564,7 +564,7 @@ local function emby_play_progress(event_name)
     MediaSourceId = state.media_source_id or state.item_id,
     PositionTicks = ticks,
     CanSeek = true,
-    IsPaused = not state.playing,
+    IsPaused = event_name == "Pause",
     IsMuted = false,
     PlayMethod = "DirectPlay",
     PlaySessionId = state.play_session_id,
