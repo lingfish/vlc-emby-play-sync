@@ -469,6 +469,13 @@ local function generate_session_id()
 end
 
 local function get_position_ticks()
+  local input = vlc.input()
+  if input then
+    local time_us = vlc.var.get(input, "time")
+    if time_us then
+      return math.floor(time_us * 10)
+    end
+  end
   local time_ms = 0
   if vlc.player and vlc.player.time then
     time_ms = vlc.player.time()
@@ -479,6 +486,13 @@ local function get_position_ticks()
 end
 
 local function get_current_uri()
+  local input = vlc.input()
+  if input then
+    local item = input:item()
+    if item then
+      return item:uri()
+    end
+  end
   local item = nil
   if vlc.player and vlc.player.item then
     item = vlc.player.item()
@@ -492,6 +506,13 @@ local function get_current_uri()
 end
 
 local function get_playback_status()
+  local input = vlc.input()
+  if input then
+    local st = vlc.var.get(input, "state")
+    if st == 3 then return "playing"
+    elseif st == 4 then return "paused"
+    elseif st then return "stopped" end
+  end
   if vlc.playlist and vlc.playlist.status then
     return vlc.playlist.status() or ""
   elseif vlc.player and vlc.player.is_playing then
