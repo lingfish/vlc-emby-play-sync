@@ -694,12 +694,8 @@ function activate()
     dwarn("no configuration found — use Configure menu to set up Emby server")
   end
 
-  local uri = get_current_uri()
-  if uri then
+  if get_current_uri() then
     match_and_cache()
-    if is_playing() and state.item_matched then
-      emby_play_start({ Id = state.item_id, Name = uri:match("[^/\\]+$") or uri })
-    end
   end
 end
 
@@ -731,10 +727,6 @@ function input_changed()
 
   clear_state()
   match_and_cache()
-
-  if is_playing() and state.item_matched then
-    emby_play_start({ Id = state.item_id, Name = uri:match("[^/\\]+$") or uri })
-  end
 end
 
 function meta_changed() end
