@@ -469,25 +469,34 @@ local function generate_session_id()
 end
 
 local function get_position_ticks()
-  dmsg("vlc.input type=%s", type(vlc.input))
-  if vlc.input then
-    local keys = {}
-    for k in pairs(vlc.input) do keys[#keys+1] = tostring(k) end
-    dmsg("vlc.input keys: %s", table.concat(keys, ","))
-
-    local mt = getmetatable(vlc.input)
-    dmsg("vlc.input metatable: %s", mt and tostring(mt) or "nil")
-    if mt then
-      local mtkeys = {}
-      for k in pairs(mt) do mtkeys[#mtkeys+1] = tostring(k) end
-      dmsg("vlc.input mt keys: %s", table.concat(mtkeys, ","))
+  -- try vlc.object.input() + vlc.var.get
+  if vlc.object and vlc.object.input then
+    local input_obj = vlc.object.input()
+    if input_obj then
+      dmsg("vlc.object.input() works, type=%s", type(input_obj))
+      local time_us = vlc.var.get(input_obj, "time")
+      if time_us and time_us > 0 then
+        return math.floor(time_us * 10)
+      end
+      dmsg("vlc.var.get time=%s", tostring(time_us))
+    else
+      dmsg("vlc.object.input() returned nil")
     end
-
-    dmsg("vlc.input.time exists=%s type=%s", tostring(vlc.input.time ~= nil), type(vlc.input.time))
-    dmsg("vlc.input.item exists=%s type=%s", tostring(vlc.input.item ~= nil), type(vlc.input.item))
-    dmsg("vlc.input.length exists=%s type=%s", tostring(vlc.input.length ~= nil), type(vlc.input.length))
-    dmsg("vlc.input.position exists=%s type=%s", tostring(vlc.input.position ~= nil), type(vlc.input.position))
-    dmsg("vlc.input.state exists=%s type=%s", tostring(vlc.input.state ~= nil), type(vlc.input.state))
+  end
+  -- try input item methods
+  if vlc.input and vlc.input.item then
+    local item = vlc.input.item()
+    if item then
+      local mt = getmetatable(item)
+      dmsg("input item metatable: %s", mt and tostring(mt) or "nil")
+      if mt then
+        local keys = {}
+        for k in pairs(mt) do keys[#keys+1] = tostring(k) end
+        dmsg("input item mt keys: %s", table.concat(keys, ","))
+      end
+      local ok, dur = pcall(item.duration, item)
+      dmsg("item:duration() ok=%s val=%s", tostring(ok), tostring(dur))
+    end
   end
   return 0
 end
@@ -694,12 +703,16 @@ function activate()
   dmsg("activating extension v%s", EXT_VERSION)
   math.randomseed(os.time())
   load_config()
-  if vlc.input then
-    local methods = {}
-    for k in pairs(vlc.input) do methods[#methods+1] = tostring(k) end
-    dmsg("vlc.input methods: %s", table.concat(methods, ", "))
-  else
-    dmsg("vlc.input is nil")
+  local modules = {"vlc.object", "vlc.var", "vlc.playlist", "vlc.input"}
+  for _, mname in ipairs(modules) do
+    local m = _G
+    for part in mname:gmatch("[%w_]+") do m = m and m[part] end
+    dmsg("%s type=%s", mname, type(m))
+    if type(m) == "table" then
+      local keys = {}
+      for k in pairs(m) do keys[#keys+1] = tostring(k) end
+      dmsg("%s keys: %s", mname, table.concat(keys, ","))
+    end
   end
   if cfg.server_url ~= "" then
     dmsg("configured for: %s", cfg.server_url)
