@@ -7,7 +7,9 @@ local EXT_VERSION = "1.0"
 local cfg = {
   server_url = "",
   api_key = "",
-  user_id = ""
+  user_id = "",
+  local_path_prefix = "",
+  emby_path_prefix = ""
 }
 
 local state = {
@@ -214,6 +216,8 @@ local function load_config()
       cfg.server_url = parsed.server_url or ""
       cfg.api_key = parsed.api_key or ""
       cfg.user_id = parsed.user_id or ""
+      cfg.local_path_prefix = parsed.local_path_prefix or ""
+      cfg.emby_path_prefix = parsed.emby_path_prefix or ""
       dmsg("config loaded from %s", path)
       return
     end
@@ -386,6 +390,32 @@ local function osd(msg)
   pcall(vlc.osd.message, msg)
 end
 
+local function emby_path_for(filepath)
+  if cfg.local_path_prefix ~= "" and cfg.emby_path_prefix ~= "" then
+    local start = filepath:find(cfg.local_path_prefix, 1, true)
+    if start == 1 then
+      local suffix = filepath:sub(#cfg.local_path_prefix + 1)
+      local translated = cfg.emby_path_prefix .. suffix
+      dmsg("translated path: %s -> %s", filepath, translated)
+      return translated
+    end
+  end
+  return filepath
+end
+
+local function search_hints(term)
+  local encoded = url_encode(term)
+  local spath = "/emby/Search/Hints?UserId=" .. url_encode(cfg.user_id) .. "&SearchTerm=" .. encoded .. "&Limit=5&IncludeMedia=true"
+  local code, resp = emby_request("GET", spath, nil)
+  if code and code >= 200 and code < 300 and resp then
+    local ok, data = pcall(json_decode, resp)
+    if ok and data and data.SearchHints and #data.SearchHints > 0 then
+      return data.SearchHints
+    end
+  end
+  return nil
+end
+
 local function emby_find_item(filepath)
   if cfg.user_id == "" then
     dwarn("no user_id configured, cannot search for items")
@@ -393,8 +423,9 @@ local function emby_find_item(filepath)
     return nil
   end
 
-  -- try exact path match via /Items endpoint
-  local encoded = url_encode(filepath)
+  -- try exact path match via /Items endpoint (with prefix translation)
+  local search_path = emby_path_for(filepath)
+  local encoded = url_encode(search_path)
   local spath = "/emby/Items?UserId=" .. url_encode(cfg.user_id) .. "&Recursive=true&Path=" .. encoded
   local code, resp = emby_request("GET", spath, nil)
   if code and code >= 200 and code < 300 and resp then
@@ -406,19 +437,21 @@ local function emby_find_item(filepath)
     end
   end
 
-  -- fallback: filename search via /Search/Hints
+  -- fallback: search hints by filename
   local filename = filepath:match("[^/\\]+$")
   if filename then
-    local name_no_ext = filename:gsub("%.[^%.]+$", "")
-    local encoded_name = url_encode(name_no_ext)
-    spath = "/emby/Search/Hints?UserId=" .. url_encode(cfg.user_id) .. "&SearchTerm=" .. encoded_name .. "&Limit=1&IncludeMedia=true"
-    code, resp = emby_request("GET", spath, nil)
-    dmsg("search hints response: %d bytes", resp and #resp or 0)
-    if code and code >= 200 and code < 300 and resp then
-      local ok, data = pcall(json_decode, resp)
-      if ok and data and data.SearchHints and #data.SearchHints > 0 then
-        local hint = data.SearchHints[1]
-        dmsg("matched item by filename: %s (%s)", hint.Name, hint.ItemId)
+    local names = { filename }
+    local no_ext = filename:gsub("%.[^%.]+$", "")
+    if no_ext ~= filename then names[#names + 1] = no_ext end
+    -- strip season/episode patterns like S2026E29
+    local clean = no_ext:gsub("[%s_%.]*[Ss]%d+[Ee]%d+", ""):gsub("^[%s%-_%.]+", ""):gsub("[%s%-_%.]+$", "")
+    if clean ~= no_ext and clean ~= "" then names[#names + 1] = clean end
+
+    for _, name in ipairs(names) do
+      local hints = search_hints(name)
+      if hints then
+        local hint = hints[1]
+        dmsg("matched item by filename '%s': %s (%s)", name, hint.Name, hint.ItemId)
         osd("Emby: matched " .. hint.Name)
         return { Id = hint.ItemId, Name = hint.Name }
       end
@@ -766,15 +799,24 @@ function show_config_dialog()
   dialog:add_label("API Key:", 1, 2, 1, 1)
   local key_input = dialog:add_password(cfg.api_key, 2, 2, 3, 1)
 
-  dialog:add_label("User ID:", 1, 3, 1, 1)
+  dialog:add_label("User ID (name or UUID):", 1, 3, 1, 1)
   local uid_input = dialog:add_text_input(cfg.user_id, 2, 3, 3, 1)
 
-  dialog:add_label("", 1, 4, 4, 1)
+  dialog:add_label("Local path prefix:", 1, 4, 1, 1)
+  local local_pref = dialog:add_text_input(cfg.local_path_prefix, 2, 4, 3, 1)
+
+  dialog:add_label("Emby path prefix:", 1, 5, 1, 1)
+  local emby_pref = dialog:add_text_input(cfg.emby_path_prefix, 2, 5, 3, 1)
+
+  dialog:add_label("", 1, 6, 4, 1)
   local function save()
     cfg.server_url = url_input:get_text()
     cfg.api_key = key_input:get_text()
     cfg.user_id = uid_input:get_text()
+    cfg.local_path_prefix = local_pref:get_text()
+    cfg.emby_path_prefix = emby_pref:get_text()
     save_config()
+    resolve_user_id()
     close_dialog()
     dmsg("configuration saved and applied")
   end
@@ -783,8 +825,8 @@ function show_config_dialog()
     close_dialog()
   end
 
-  dialog:add_button("Save", save, 2, 5, 1, 1)
-  dialog:add_button("Cancel", cancel, 3, 5, 1, 1)
+  dialog:add_button("Save", save, 2, 7, 1, 1)
+  dialog:add_button("Cancel", cancel, 3, 7, 1, 1)
   dialog:show()
 end
 
@@ -796,6 +838,10 @@ function show_status()
   lines[#lines + 1] = "Server: " .. (cfg.server_url ~= "" and cfg.server_url or "not configured")
   lines[#lines + 1] = "API Key: " .. (cfg.api_key ~= "" and "****" or "not set")
   lines[#lines + 1] = "User ID: " .. (cfg.user_id ~= "" and cfg.user_id or "not set")
+  if cfg.local_path_prefix ~= "" then
+    lines[#lines + 1] = "Local prefix: " .. cfg.local_path_prefix
+    lines[#lines + 1] = "Emby prefix: " .. cfg.emby_path_prefix
+  end
   lines[#lines + 1] = ""
   lines[#lines + 1] = "Item matched: " .. tostring(state.item_matched)
   if state.item_id then
