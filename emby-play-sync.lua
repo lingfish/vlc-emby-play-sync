@@ -431,7 +431,7 @@ local function emby_find_item(filepath)
   if code and code >= 200 and code < 300 and resp then
     local ok, data = pcall(json_decode, resp)
     if ok and data and data.Items and #data.Items > 0 then
-      dmsg("matched item by path: %s (id=%s type=%s)", data.Items[1].Name, data.Items[1].Id, type(data.Items[1].Id))
+      dmsg("matched item by path: %s (%s)", data.Items[1].Name, data.Items[1].Id)
       osd("Emby: matched " .. data.Items[1].Name)
       return data.Items[1]
     end
