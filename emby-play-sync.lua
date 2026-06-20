@@ -464,7 +464,7 @@ local function emby_find_item(filepath)
 end
 
 local function generate_session_id()
-  local t = tostring(vlc.misc.mdate() or os.time() * 1000000)
+  local t = tostring(os.time() * 1000000)
   return "vlc-" .. t .. "-" .. tostring(math.random(10000, 99999))
 end
 
