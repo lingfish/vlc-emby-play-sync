@@ -39,16 +39,19 @@ All `vlc.*` calls live in a single `adapter` table at the top of the file. The r
 - `meta_changed()` — required stub (VLC probes for it)
 - `menu()` / `trigger_menu()` — "Sync Now", "Configure", "Status"
 
-### Emby API calls
+### Emby Client seam
 
-| Trigger | Endpoint | Purpose |
-|---------|----------|---------|
-| Play starts | `POST /Sessions/Playing` | Start playback session |
-| Pause/resume | `POST /Sessions/Playing/Progress` | Report position + event name |
-| Stop / VLC close | `POST /Sessions/Playing/Stopped` | End playback session |
-| Users lookup | `GET /Users` | Resolve username to UUID |
-| Item by path | `GET /Items?UserId=&Recursive=true&Path=` | Find ItemId by file path |
-| Search hints | `GET /Search/Hints?UserId=&SearchTerm=&Limit=5` | Fallback filename search |
+All Emby REST API protocol lives in the `emby` table (after JSON helpers). It exposes methods that encapsulate URL building, payload encoding, and response parsing. Higher-level functions (session lifecycle, matching, user resolution) call these methods and never touch `emby_request` directly.
+
+| Emby method | Endpoint | Returns |
+|-------------|----------|---------|
+| `find_item_by_path(path)` | `GET /Items?UserId=&Recursive=true&Path=` | item or nil |
+| `search_hints(term)` | `GET /Search/Hints?UserId=&SearchTerm=&Limit=5` | hints or nil |
+| `save_position(item_id, ticks)` | `POST /Users/{uid}/Items/{iid}/UserData` | bool |
+| `start_session(item_id, pos, sid)` | `POST /Sessions/Playing` | bool |
+| `report_progress(item_id, msid, pos, sid, event)` | `POST /Sessions/Playing/Progress` | bool |
+| `end_session(item_id, msid, pos, sid)` | `POST /Sessions/Playing/Stopped` | bool |
+| `list_users()` | `GET /Users` | users or nil |
 
 Auth: `X-Emby-Token` header with API key (static key from Emby Admin).
 

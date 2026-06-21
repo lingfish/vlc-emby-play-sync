@@ -397,6 +397,130 @@ local function json_encode(v)
   end
 end
 
+-- Emby Client — Emby REST API calls behind a focused interface
+
+local emby = {}
+
+local function emby_build_url(path)
+  local base = cfg.server_url:gsub("/+$", "")
+  return base .. path
+end
+
+local function emby_request(method, spath, body)
+  if cfg.server_url == "" or cfg.api_key == "" then
+    adapter.warn("emby not configured yet")
+    return nil
+  end
+  local url = emby_build_url(spath)
+  local headers = {
+    "X-Emby-Token: " .. cfg.api_key,
+    "X-Emby-Authorization: MediaBrowser Client=\"VLC Play Sync\", Device=\"VLC\", Version=\"" .. EXT_VERSION .. "\"",
+    "Content-Type: application/json",
+    "Accept: application/json",
+  }
+  local code, resp = adapter.http_request(method, url, headers, body)
+  if not code then
+    adapter.error("emby request failed: %s", tostring(resp))
+    return nil
+  end
+  if code >= 400 then
+    adapter.error("emby error %s %s -> %d: %s", method, spath, code, tostring(resp))
+  end
+  adapter.debug("emby %s %s -> %d (%d bytes)", method, spath, code, #(resp or ""))
+  return code, resp
+end
+
+function emby.find_item_by_path(search_path)
+  local spath = "/emby/Items?UserId=" .. url_encode(cfg.user_id) .. "&Recursive=true&Path=" .. url_encode(search_path)
+  local code, resp = emby_request("GET", spath, nil)
+  if code and code >= 200 and code < 300 and resp then
+    local ok, data = pcall(json_decode, resp)
+    if ok and data and data.Items and #data.Items > 0 then
+      return data.Items[1]
+    end
+  end
+  return nil
+end
+
+function emby.search_hints(term)
+  local spath = "/emby/Search/Hints?UserId=" .. url_encode(cfg.user_id) .. "&SearchTerm=" .. url_encode(term) .. "&Limit=5&IncludeMedia=true"
+  local code, resp = emby_request("GET", spath, nil)
+  if code and code >= 200 and code < 300 and resp then
+    local ok, data = pcall(json_decode, resp)
+    if ok and data and data.SearchHints and #data.SearchHints > 0 then
+      return data.SearchHints
+    end
+  end
+  return nil
+end
+
+function emby.save_position(item_id, ticks)
+  local payload = json_encode({
+    PlaybackPositionTicks = ticks,
+    Played = false
+  })
+  local spath = "/emby/Users/" .. url_encode(cfg.user_id) .. "/Items/" .. url_encode(item_id) .. "/UserData"
+  local code = emby_request("POST", spath, payload)
+  return code and code >= 200 and code < 300
+end
+
+function emby.start_session(item_id, position, session_id)
+  local payload = json_encode({
+    ItemId = item_id,
+    MediaSourceId = item_id,
+    PositionTicks = position,
+    CanSeek = true,
+    IsPaused = false,
+    IsMuted = false,
+    PlayMethod = "DirectPlay",
+    PlaySessionId = session_id
+  })
+  local spath = "/emby/Sessions/Playing?userId=" .. url_encode(cfg.user_id)
+  local code = emby_request("POST", spath, payload)
+  return code and code >= 200 and code < 300
+end
+
+function emby.report_progress(item_id, media_source_id, position, session_id, event_name)
+  local payload = json_encode({
+    ItemId = item_id,
+    MediaSourceId = media_source_id,
+    PositionTicks = position,
+    CanSeek = true,
+    IsPaused = event_name == "Pause",
+    IsMuted = false,
+    PlayMethod = "DirectPlay",
+    PlaySessionId = session_id,
+    EventName = event_name
+  })
+  local spath = "/emby/Sessions/Playing/Progress?userId=" .. url_encode(cfg.user_id)
+  local code = emby_request("POST", spath, payload)
+  return code and code >= 200 and code < 300
+end
+
+function emby.end_session(item_id, media_source_id, position, session_id)
+  local payload = json_encode({
+    ItemId = item_id,
+    MediaSourceId = media_source_id,
+    PositionTicks = position,
+    PlaySessionId = session_id,
+    Failed = false
+  })
+  local spath = "/emby/Sessions/Playing/Stopped?userId=" .. url_encode(cfg.user_id)
+  local code = emby_request("POST", spath, payload)
+  return code and code >= 200 and code < 300
+end
+
+function emby.list_users()
+  local code, resp = emby_request("GET", "/emby/Users", nil)
+  if code and code >= 200 and code < 300 and resp then
+    local ok, users = pcall(json_decode, resp)
+    if ok and type(users) == "table" then
+      return users
+    end
+  end
+  return nil
+end
+
 -- Config persistence
 
 local function load_config()
@@ -445,40 +569,6 @@ local function save_config()
   adapter.debug("config saved to %s", path)
 end
 
--- HTTP client wrapper
-
-local function build_emby_url(path)
-  local base = cfg.server_url:gsub("/+$", "")
-  return base .. path
-end
-
-local function emby_request(method, spath, body)
-  if cfg.server_url == "" or cfg.api_key == "" then
-    adapter.warn("emby not configured yet")
-    return nil
-  end
-
-  local url = build_emby_url(spath)
-  local emby_headers = {
-    "X-Emby-Token: " .. cfg.api_key,
-    "X-Emby-Authorization: MediaBrowser Client=\"VLC Play Sync\", Device=\"VLC\", Version=\"" .. EXT_VERSION .. "\"",
-    "Content-Type: application/json",
-    "Accept: application/json",
-  }
-
-  local code, resp = adapter.http_request(method, url, emby_headers, body)
-  if not code then
-    adapter.error("request failed: %s", tostring(resp))
-    return nil
-  end
-
-  if code >= 400 then
-    adapter.error("emby error response: %s", tostring(resp))
-  end
-  adapter.debug("emby %s %s -> %d (%d bytes)", method, spath, code, #(resp or ""))
-  return code, resp
-end
-
 -- Emby API helpers
 
 local function emby_path_for(filepath)
@@ -494,19 +584,6 @@ local function emby_path_for(filepath)
   return filepath
 end
 
-local function search_hints(term)
-  local encoded = url_encode(term)
-  local spath = "/emby/Search/Hints?UserId=" .. url_encode(cfg.user_id) .. "&SearchTerm=" .. encoded .. "&Limit=5&IncludeMedia=true"
-  local code, resp = emby_request("GET", spath, nil)
-  if code and code >= 200 and code < 300 and resp then
-    local ok, data = pcall(json_decode, resp)
-    if ok and data and data.SearchHints and #data.SearchHints > 0 then
-      return data.SearchHints
-    end
-  end
-  return nil
-end
-
 local function emby_find_item(filepath)
   if cfg.user_id == "" then
     adapter.warn("no user_id configured, cannot search for items")
@@ -514,17 +591,11 @@ local function emby_find_item(filepath)
     return nil
   end
 
-  local search_path = emby_path_for(filepath)
-  local encoded = url_encode(search_path)
-  local spath = "/emby/Items?UserId=" .. url_encode(cfg.user_id) .. "&Recursive=true&Path=" .. encoded
-  local code, resp = emby_request("GET", spath, nil)
-  if code and code >= 200 and code < 300 and resp then
-    local ok, data = pcall(json_decode, resp)
-    if ok and data and data.Items and #data.Items > 0 then
-      adapter.debug("matched item by path: %s (%s)", data.Items[1].Name, data.Items[1].Id)
-      adapter.osd_message("Emby: matched " .. data.Items[1].Name)
-      return data.Items[1]
-    end
+  local item = emby.find_item_by_path(emby_path_for(filepath))
+  if item then
+    adapter.debug("matched item by path: %s (%s)", item.Name, item.Id)
+    adapter.osd_message("Emby: matched " .. item.Name)
+    return item
   end
 
   local filename = filepath:match("[^/\\]+$")
@@ -536,7 +607,7 @@ local function emby_find_item(filepath)
     if clean ~= no_ext and clean ~= "" then names[#names + 1] = clean end
 
     for _, name in ipairs(names) do
-      local hints = search_hints(name)
+      local hints = emby.search_hints(name)
       if hints then
         local hint = hints[1]
         adapter.debug("matched item by filename '%s': %s (%s)", name, hint.Name, hint.ItemId)
@@ -565,16 +636,10 @@ end
 
 local function emby_save_position(ticks)
   if not state.item_id or cfg.user_id == "" then return end
-  local payload = {
-    PlaybackPositionTicks = ticks,
-    Played = false
-  }
-  local spath = "/emby/Users/" .. url_encode(cfg.user_id) .. "/Items/" .. url_encode(state.item_id) .. "/UserData"
-  local code, resp = emby_request("POST", spath, json_encode(payload))
-  if code and code >= 200 and code < 300 then
+  if emby.save_position(state.item_id, ticks) then
     adapter.debug("position saved: %d ticks", ticks)
   else
-    adapter.warn("position save failed: %s body=%s", tostring(code), tostring(resp))
+    adapter.warn("position save failed")
   end
 end
 
@@ -586,24 +651,12 @@ local function emby_play_start(item)
   if not state.play_session_id then
     state.play_session_id = generate_session_id()
   end
-  local payload = {
-    ItemId = item.Id,
-    MediaSourceId = item.Id,
-    PositionTicks = ticks,
-    CanSeek = true,
-    IsPaused = false,
-    IsMuted = false,
-    PlayMethod = "DirectPlay",
-    PlaySessionId = state.play_session_id
-  }
-  local spath = "/emby/Sessions/Playing?userId=" .. url_encode(cfg.user_id)
-  local code, _ = emby_request("POST", spath, json_encode(payload))
-  if code and code >= 200 and code < 300 then
+  if emby.start_session(item.Id, ticks, state.play_session_id) then
     state.playing = true
     state.last_sync = os.time()
     adapter.debug("playback started: %s (%d ticks)", item.Name, ticks)
   else
-    adapter.warn("play start failed: %s", tostring(code))
+    adapter.warn("play start failed")
   end
 end
 
@@ -613,47 +666,25 @@ local function emby_play_progress(event_name)
     return
   end
   local ticks = adapter.get_position_ticks()
-  local payload = {
-    ItemId = state.item_id,
-    MediaSourceId = state.media_source_id or state.item_id,
-    PositionTicks = ticks,
-    CanSeek = true,
-    IsPaused = event_name == "Pause",
-    IsMuted = false,
-    PlayMethod = "DirectPlay",
-    PlaySessionId = state.play_session_id,
-    EventName = event_name
-  }
-  local spath = "/emby/Sessions/Playing/Progress?userId=" .. url_encode(cfg.user_id)
-  local code, _ = emby_request("POST", spath, json_encode(payload))
-  if code and code >= 200 and code < 300 then
+  if emby.report_progress(state.item_id, state.media_source_id or state.item_id, ticks, state.play_session_id, event_name) then
     state.last_sync = os.time()
     adapter.debug("progress: %s -> %d ticks", event_name, ticks)
     if event_name == "Pause" or event_name == "TimeUpdate" then
       emby_save_position(ticks)
     end
   else
-    adapter.warn("progress failed: %s", tostring(code))
+    adapter.warn("progress failed: %s", event_name)
   end
 end
 
 local function emby_play_stop()
   if not state.item_id then return end
   local ticks = adapter.get_position_ticks()
-  local payload = {
-    ItemId = state.item_id,
-    MediaSourceId = state.media_source_id or state.item_id,
-    PositionTicks = ticks,
-    PlaySessionId = state.play_session_id,
-    Failed = false
-  }
-  local spath = "/emby/Sessions/Playing/Stopped?userId=" .. url_encode(cfg.user_id)
-  local code, _ = emby_request("POST", spath, json_encode(payload))
-  if code and code >= 200 and code < 300 then
+  if emby.end_session(state.item_id, state.media_source_id or state.item_id, ticks, state.play_session_id) then
     adapter.debug("playback stopped at %d ticks", ticks)
     emby_save_position(ticks)
   else
-    adapter.warn("stop failed: %s", tostring(code))
+    adapter.warn("stop failed")
   end
   state.playing = false
   state.play_session_id = nil
@@ -725,20 +756,17 @@ local function resolve_user_id()
     return
   end
   adapter.debug("resolving username '%s' to UUID via /Users", cfg.user_id)
-  local code, resp = emby_request("GET", "/emby/Users", nil)
-  if code and code >= 200 and code < 300 and resp then
-    local ok, users = pcall(json_decode, resp)
-    if ok and type(users) == "table" then
-      for _, user in ipairs(users) do
-        if user.Name == cfg.user_id then
-          cfg.user_id = user.Id
-          save_config()
-          adapter.debug("resolved user '%s' to UUID: %s", user.Name, user.Id)
-          return
-        end
+  local users = emby.list_users()
+  if users then
+    for _, user in ipairs(users) do
+      if user.Name == cfg.user_id then
+        cfg.user_id = user.Id
+        save_config()
+        adapter.debug("resolved user '%s' to UUID: %s", user.Name, user.Id)
+        return
       end
-      adapter.warn("no user found with name '%s'", cfg.user_id)
     end
+    adapter.warn("no user found with name '%s'", cfg.user_id)
   else
     adapter.warn("failed to fetch users, cannot resolve username")
   end
