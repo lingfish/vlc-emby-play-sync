@@ -2,7 +2,7 @@
 -- Syncs current playback position to Emby server as a resume point.
 
 local EXT_TITLE = "Emby Play Sync"
-local EXT_VERSION = "1.0"
+local EXT_VERSION = "1.1"
 
 local cfg = {
   server_url = "",
