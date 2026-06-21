@@ -521,6 +521,51 @@ function emby.list_users()
   return nil
 end
 
+-- Media Matcher — matches file paths to Emby items
+
+local matcher = {}
+
+function matcher.translate_path(filepath)
+  if cfg.local_path_prefix ~= "" and cfg.emby_path_prefix ~= "" then
+    local start = filepath:find(cfg.local_path_prefix, 1, true)
+    if start == 1 then
+      local suffix = filepath:sub(#cfg.local_path_prefix + 1)
+      local translated = cfg.emby_path_prefix .. suffix
+      adapter.debug("translated path: %s -> %s", filepath, translated)
+      return translated
+    end
+  end
+  return filepath
+end
+
+function matcher.alternate_names(filename)
+  local names = { filename }
+  local no_ext = filename:gsub("%.[^%.]+$", "")
+  if no_ext ~= filename then names[#names + 1] = no_ext end
+  local clean = no_ext:gsub("[%s_%.]*[Ss]%d+[Ee]%d+", ""):gsub("^[%s%-_%.]+", ""):gsub("[%s%-_%.]+$", "")
+  if clean ~= no_ext and clean ~= "" then names[#names + 1] = clean end
+  return names
+end
+
+function matcher.match(filepath)
+  if cfg.user_id == "" then return nil end
+
+  local item = emby.find_item_by_path(matcher.translate_path(filepath))
+  if item then return item end
+
+  local filename = filepath:match("[^/\\]+$")
+  if filename then
+    for _, name in ipairs(matcher.alternate_names(filename)) do
+      local hints = emby.search_hints(name)
+      if hints and #hints > 0 then
+        return { Id = hints[1].ItemId, Name = hints[1].Name }
+      end
+    end
+  end
+
+  return nil
+end
+
 -- Config persistence
 
 local function load_config()
@@ -567,59 +612,6 @@ local function save_config()
     return
   end
   adapter.debug("config saved to %s", path)
-end
-
--- Emby API helpers
-
-local function emby_path_for(filepath)
-  if cfg.local_path_prefix ~= "" and cfg.emby_path_prefix ~= "" then
-    local start = filepath:find(cfg.local_path_prefix, 1, true)
-    if start == 1 then
-      local suffix = filepath:sub(#cfg.local_path_prefix + 1)
-      local translated = cfg.emby_path_prefix .. suffix
-      adapter.debug("translated path: %s -> %s", filepath, translated)
-      return translated
-    end
-  end
-  return filepath
-end
-
-local function emby_find_item(filepath)
-  if cfg.user_id == "" then
-    adapter.warn("no user_id configured, cannot search for items")
-    adapter.osd_message("Emby: User ID not configured")
-    return nil
-  end
-
-  local item = emby.find_item_by_path(emby_path_for(filepath))
-  if item then
-    adapter.debug("matched item by path: %s (%s)", item.Name, item.Id)
-    adapter.osd_message("Emby: matched " .. item.Name)
-    return item
-  end
-
-  local filename = filepath:match("[^/\\]+$")
-  if filename then
-    local names = { filename }
-    local no_ext = filename:gsub("%.[^%.]+$", "")
-    if no_ext ~= filename then names[#names + 1] = no_ext end
-    local clean = no_ext:gsub("[%s_%.]*[Ss]%d+[Ee]%d+", ""):gsub("^[%s%-_%.]+", ""):gsub("[%s%-_%.]+$", "")
-    if clean ~= no_ext and clean ~= "" then names[#names + 1] = clean end
-
-    for _, name in ipairs(names) do
-      local hints = emby.search_hints(name)
-      if hints then
-        local hint = hints[1]
-        adapter.debug("matched item by filename '%s': %s (%s)", name, hint.Name, hint.ItemId)
-        adapter.osd_message("Emby: matched " .. hint.Name)
-        return { Id = hint.ItemId, Name = hint.Name }
-      end
-    end
-  end
-
-  adapter.warn("no emby item found for: %s", filepath)
-  adapter.osd_message("Emby: no match for this file")
-  return nil
 end
 
 local function generate_session_id()
@@ -713,14 +705,18 @@ local function match_and_cache()
   end
 
   adapter.debug("attempting to match: %s", path)
-  local item = emby_find_item(path)
+  local item = matcher.match(path)
   if item then
+    adapter.debug("matched item: %s (%s)", item.Name, item.Id)
+    adapter.osd_message("Emby: matched " .. item.Name)
     state.item_id = item.Id
     state.media_source_id = item.Id
     state.item_matched = true
     return true
   end
 
+  adapter.warn("no emby item found for: %s", path)
+  adapter.osd_message("Emby: no match for this file")
   state.item_matched = false
   state.item_id = nil
   state.media_source_id = nil

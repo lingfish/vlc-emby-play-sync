@@ -65,14 +65,17 @@ Auth: `X-Emby-Token` header with API key (static key from Emby Admin).
 | `local_path_prefix` | VLC-side path prefix for media files (e.g. `/mnt/nas/`) |
 | `emby_path_prefix` | Emby-side path prefix (e.g. `/media/`) |
 
-### Media matching
+### Media Matcher seam
 
-1. Extract file URI from `vlc.input.item():uri()`
-2. Convert to local path via `vlc.strings.make_path()`
-3. Translate path prefix (`local_path_prefix` → `emby_path_prefix`)
-4. Query Emby: `GET /Items?UserId={uuid}&Recursive=true&Path={translated_path}`
-5. Fallback: `GET /Search/Hints` by filename (strips extension, then strips S##E## patterns)
-6. Cache ItemId and MediaSourceId for the session
+All path-to-item matching logic lives in the `matcher` table. It owns prefix translation, exact path search, filename fallback (with S##E## stripping), and the fallback chain policy — all behind `matcher.match(local_path)`.
+
+| Matcher method | Purpose |
+|----------------|---------|
+| `translate_path(path)` | Map `local_path_prefix` → `emby_path_prefix` |
+| `alternate_names(filename)` | Generate search variants (no ext, stripped S##E##) |
+| `match(path)` | Try exact path, fallback to filename variants |
+
+`match_and_cache()` calls `matcher.match(path)` and handles side effects (logging, OSD, state update).
 
 ### Timing
 
