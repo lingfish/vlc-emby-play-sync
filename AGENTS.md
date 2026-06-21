@@ -13,6 +13,24 @@ Single-file Lua extension (`emby-play-sync.lua`) using VLC's Lua extension API.
 | `emby-play-sync.lua` | Main VLC Lua extension — all logic in one file |
 | `install.sh` | Symlinks extension into VLC's extension directory |
 
+### VLC Adapter seam
+
+All `vlc.*` calls live in a single `adapter` table at the top of the file. The rest of the logic calls `adapter.*` methods and never touches `vlc.*` directly. This creates a **seam** — swap `adapter` for a test adapter to run the full extension logic without VLC.
+
+| Adapter method | Wraps | Returns |
+|----------------|-------|---------|
+| `debug/warn/error` | `vlc.msg.{dbg,warn,err}` | — |
+| `config_path` | `vlc.config.userdatadir()` | `path` or nil |
+| `read_file` / `write_file` | `vlc.io.open` | data / bool |
+| `http_request` | `vlc.net.{connect_tcp,send,recv,poll,close}` | `status, body, header` |
+| `get_current_uri` | `vlc.input.item():uri()` | `uri` or nil |
+| `get_position_ticks` | `vlc.object.input()` → `vlc.var.get("time")` | ticks (int) |
+| `get_playback_status` | `vlc.playlist.status()` + `vlc.var.get("state")` | `"playing"`/`"paused"`/`""` |
+| `get_local_path` | `vlc.strings.make_path()` / `decode_uri()` | path or nil |
+| `osd_message` | `vlc.osd.message` | — |
+| `show_config_dialog` | `vlc.dialog` (takes `cfg`, calls `on_save(new_cfg)`) | — |
+| `show_status_dialog` | `vlc.dialog` (takes lines table) | — |
+
 ### VLC Lua APIs used
 
 - `descriptor()` / `activate()` / `deactivate()` / `close()` — extension lifecycle
@@ -20,9 +38,6 @@ Single-file Lua extension (`emby-play-sync.lua`) using VLC's Lua extension API.
 - `playing_changed()` — fires on play/pause/stop → push position to Emby
 - `meta_changed()` — required stub (VLC probes for it)
 - `menu()` / `trigger_menu()` — "Sync Now", "Configure", "Status"
-- `vlc.net` — raw TCP HTTP requests to Emby REST API
-- `vlc.dialog` — configuration UI
-- `vlc.input` / `vlc.player` — get current position and media URI
 
 ### Emby API calls
 
