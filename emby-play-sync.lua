@@ -642,9 +642,11 @@ function playback.clear()
   play_media_source_id = nil
 end
 
--- Config persistence
+-- Config — manages config persistence and user resolution
 
-local function load_config()
+local config = {}
+
+function config.load()
   local path = adapter.config_path()
   if not path then
     adapter.debug("no user data dir, cannot load config")
@@ -672,7 +674,7 @@ local function load_config()
   end
 end
 
-local function save_config()
+function config.save()
   local path = adapter.config_path()
   if not path then
     adapter.error("no user data dir, cannot save config")
@@ -690,6 +692,33 @@ local function save_config()
   adapter.debug("config saved to %s", path)
 end
 
+function config.update(t)
+  cfg.server_url = t.server_url or ""
+  cfg.api_key = t.api_key or ""
+  cfg.user_id = t.user_id or ""
+  cfg.local_path_prefix = t.local_path_prefix or ""
+  cfg.emby_path_prefix = t.emby_path_prefix or ""
+end
+
+function config.resolve_user()
+  if cfg.user_id == "" then return end
+  if cfg.user_id:match("^[%x%-]+$") and (#cfg.user_id == 32 or #cfg.user_id == 36) then return end
+  adapter.debug("resolving username '%s' to UUID via /Users", cfg.user_id)
+  local users = emby.list_users()
+  if users then
+    for _, user in ipairs(users) do
+      if user.Name == cfg.user_id then
+        cfg.user_id = user.Id
+        config.save()
+        adapter.debug("resolved user '%s' to UUID: %s", user.Name, user.Id)
+        return
+      end
+    end
+    adapter.warn("no user found with name '%s'", cfg.user_id)
+  else
+    adapter.warn("failed to fetch users, cannot resolve username")
+  end
+end
 
 
 -- Item matching
@@ -753,36 +782,14 @@ function descriptor()
   }
 end
 
-local function resolve_user_id()
-  if cfg.user_id == "" then return end
-  if cfg.user_id:match("^[%x%-]+$") and (#cfg.user_id == 32 or #cfg.user_id == 36) then
-    return
-  end
-  adapter.debug("resolving username '%s' to UUID via /Users", cfg.user_id)
-  local users = emby.list_users()
-  if users then
-    for _, user in ipairs(users) do
-      if user.Name == cfg.user_id then
-        cfg.user_id = user.Id
-        save_config()
-        adapter.debug("resolved user '%s' to UUID: %s", user.Name, user.Id)
-        return
-      end
-    end
-    adapter.warn("no user found with name '%s'", cfg.user_id)
-  else
-    adapter.warn("failed to fetch users, cannot resolve username")
-  end
-end
-
 function activate()
   adapter.debug("activating extension v%s", EXT_VERSION)
   math.randomseed(os.time())
-  load_config()
+  config.load()
 
   if cfg.server_url ~= "" then
     adapter.debug("configured for: %s", cfg.server_url)
-    resolve_user_id()
+    config.resolve_user()
   else
     adapter.warn("no configuration found — use Configure menu to set up Emby server")
   end
@@ -863,13 +870,9 @@ function trigger_menu(id)
     end
   elseif id == 2 then
     adapter.show_config_dialog(cfg, function(new_cfg)
-      cfg.server_url = new_cfg.server_url
-      cfg.api_key = new_cfg.api_key
-      cfg.user_id = new_cfg.user_id
-      cfg.local_path_prefix = new_cfg.local_path_prefix
-      cfg.emby_path_prefix = new_cfg.emby_path_prefix
-      save_config()
-      resolve_user_id()
+      config.update(new_cfg)
+      config.save()
+      config.resolve_user()
       adapter.debug("configuration saved and applied")
     end)
   elseif id == 3 then

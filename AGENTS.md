@@ -65,6 +65,19 @@ Auth: `X-Emby-Token` header with API key (static key from Emby Admin).
 | `local_path_prefix` | VLC-side path prefix for media files (e.g. `/mnt/nas/`) |
 | `emby_path_prefix` | Emby-side path prefix (e.g. `/media/`) |
 
+### Config Module
+
+Config persistence and user resolution live in the `config` table. It owns reading/writing config JSON to disk, applying updates from the dialog, and resolving a username to a UUID.
+
+| Config method | Purpose |
+|---------------|---------|
+| `load()` | Read config JSON from disk into `cfg` table |
+| `save()` | Write `cfg` table as JSON to disk |
+| `update(t)` | Apply a config table to `cfg` (used by dialog save) |
+| `resolve_user()` | If `cfg.user_id` is a name (not UUID), resolve via `GET /Users` and persist UUID |
+
+`activate()` calls `config.load()` then `config.resolve_user()`. The dialog save handler in `trigger_menu` calls `config.update()` → `config.save()` → `config.resolve_user()`.
+
 ### Media Matcher seam
 
 All path-to-item matching logic lives in the `matcher` table. It owns prefix translation, exact path search, filename fallback (with S##E## stripping), and the fallback chain policy — all behind `matcher.match(local_path)`.
