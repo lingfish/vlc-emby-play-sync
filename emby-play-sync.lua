@@ -13,28 +13,232 @@ local cfg = {
 }
 
 local state = {
-  playing = false,
   item_id = nil,
   media_source_id = nil,
-  play_session_id = nil,
   item_matched = false,
-  last_sync = 0,
   last_status = ""
 }
 
-local function dmsg(...)
+-- [[ VLC Adapter — wraps all vlc.* calls behind a narrow seam ]]
+
+local adapter = {}
+
+function adapter.debug(...)
   vlc.msg.dbg("[" .. EXT_TITLE .. "] " .. string.format(...))
 end
 
-local function dwarn(...)
+function adapter.warn(...)
   vlc.msg.warn("[" .. EXT_TITLE .. "] " .. string.format(...))
 end
 
-local function derr(...)
+function adapter.error(...)
   vlc.msg.err("[" .. EXT_TITLE .. "] " .. string.format(...))
 end
 
+function adapter.config_path()
+  local userdata = vlc.config.userdatadir()
+  if not userdata then return nil end
+  return userdata .. "/emby_play_sync.json"
+end
+
+function adapter.read_file(path)
+  local f = vlc.io.open(path, "rb")
+  if not f then return nil end
+  local data = f:read("*all")
+  f:close()
+  return data
+end
+
+function adapter.write_file(path, data)
+  local f = vlc.io.open(path, "wb")
+  if not f then return false end
+  f:write(data)
+  f:close()
+  return true
+end
+
+function adapter.http_request(method, url, headers, body)
+  local parsed = vlc.strings.url_parse(url)
+  local host = parsed["host"]
+  local port = tonumber(parsed["port"] or "8096")
+  local req_path = parsed["path"] or "/"
+  if parsed["option"] and parsed["option"] ~= "" then
+    req_path = req_path .. "?" .. parsed["option"]
+  end
+  if not host then return nil, "invalid URL" end
+
+  local function send(h, p, rp)
+    local lines = {
+      method .. " " .. rp .. " HTTP/1.0",
+      "Host: " .. h .. ":" .. p,
+    }
+    for _, hdr in ipairs(headers or {}) do
+      lines[#lines + 1] = hdr
+    end
+    if body then
+      lines[#lines + 1] = "Content-Length: " .. #body
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = ""
+
+    local req = table.concat(lines, "\r\n") .. (body or "")
+    local fd = vlc.net.connect_tcp(h, p)
+    if not fd then return nil end
+    vlc.net.send(fd, req)
+    local pfds = { [fd] = vlc.net.POLLIN }
+    vlc.net.poll(pfds)
+    local raw = ""
+    local chunk = vlc.net.recv(fd, 4096)
+    while chunk do
+      raw = raw .. chunk
+      vlc.net.poll(pfds)
+      chunk = vlc.net.recv(fd, 4096)
+    end
+    vlc.net.close(fd)
+    return raw
+  end
+
+  local raw = send(host, port, req_path)
+  if not raw then return nil, "connection failed" end
+
+  local crlf = raw:find("\r\n\r\n")
+  local hdr_end, body_start
+  if crlf then
+    hdr_end, body_start = crlf, crlf + 4
+  else
+    local lf = raw:find("\n\n")
+    if not lf then return nil, "malformed response" end
+    hdr_end, body_start = lf, lf + 2
+  end
+
+  local hdr_part = raw:sub(1, hdr_end - 1)
+  local body_part = raw:sub(body_start)
+  local status_line = hdr_part:match("HTTP/%d%.%d (%d+)")
+  local status_code = tonumber(status_line)
+  if not status_code then return nil, "no status line" end
+
+  if status_code == 301 or status_code == 302 or status_code == 307 then
+    local location = hdr_part:match("Location: ([^\r\n]+)")
+    if location then
+      local lp = vlc.strings.url_parse(location)
+      local lh = lp["host"]
+      local lport = tonumber(lp["port"] or "8096")
+      local lrp = lp["path"] or "/"
+      if lp["option"] and lp["option"] ~= "" then
+        lrp = lrp .. "?" .. lp["option"]
+      end
+      if lh then
+        raw = send(lh, lport, lrp)
+        if not raw then return nil, "redirect failed" end
+        crlf = raw:find("\r\n\r\n")
+        if crlf then
+          hdr_end, body_start = crlf, crlf + 4
+        else
+          local lf2 = raw:find("\n\n")
+          if not lf2 then return nil, "redirect malformed" end
+          hdr_end, body_start = lf2, lf2 + 2
+        end
+        hdr_part = raw:sub(1, hdr_end - 1)
+        body_part = raw:sub(body_start)
+        status_line = hdr_part:match("HTTP/%d%.%d (%d+)")
+        status_code = tonumber(status_line)
+      end
+    end
+  end
+
+  return status_code, body_part, hdr_part
+end
+
+function adapter.get_current_uri()
+  if vlc.input and vlc.input.item then
+    local item = vlc.input.item()
+    if item then return item:uri() end
+  end
+  return nil
+end
+
+function adapter.get_position_ticks()
+  if vlc.object and vlc.object.input then
+    local input_obj = vlc.object.input()
+    if input_obj then
+      local time_us = vlc.var.get(input_obj, "time")
+      if time_us and time_us > 0 then
+        return math.floor(time_us * 10)
+      end
+    end
+  end
+  return 0
+end
+
+function adapter.get_playback_status()
+  if vlc.playlist and vlc.playlist.status then
+    local st = vlc.playlist.status()
+    if st and st ~= "" then return st end
+  end
+  if vlc.object and vlc.object.input then
+    local input_obj = vlc.object.input()
+    if input_obj then
+      local st = vlc.var.get(input_obj, "state")
+      if st == 3 then return "playing"
+      elseif st == 4 then return "paused" end
+    end
+  end
+  return ""
+end
+
+function adapter.get_local_path(uri)
+  if not uri then return nil end
+  if uri:sub(1, 7) ~= "file://" then return nil end
+  local path = vlc.strings.make_path(uri)
+  if path and path ~= "" then return path end
+  return vlc.strings.decode_uri(uri:match("^file://(.+)$") or uri)
+end
+
+function adapter.osd_message(msg)
+  pcall(vlc.osd.message, msg)
+end
+
+function adapter.show_config_dialog(current, on_save)
+  local d = vlc.dialog(EXT_TITLE .. " — Configuration")
+  d:add_label("Emby Server URL:", 1, 1, 1, 1)
+  local url_input = d:add_text_input(current.server_url, 2, 1, 3, 1)
+  d:add_label("API Key:", 1, 2, 1, 1)
+  local key_input = d:add_password(current.api_key, 2, 2, 3, 1)
+  d:add_label("User ID (name or UUID):", 1, 3, 1, 1)
+  local uid_input = d:add_text_input(current.user_id, 2, 3, 3, 1)
+  d:add_label("Local path prefix:", 1, 4, 1, 1)
+  local local_pref = d:add_text_input(current.local_path_prefix, 2, 4, 3, 1)
+  d:add_label("Emby path prefix:", 1, 5, 1, 1)
+  local emby_pref = d:add_text_input(current.emby_path_prefix, 2, 5, 3, 1)
+  d:add_label("", 1, 6, 4, 1)
+  local function save()
+    on_save({
+      server_url = url_input:get_text(),
+      api_key = key_input:get_text(),
+      user_id = uid_input:get_text(),
+      local_path_prefix = local_pref:get_text(),
+      emby_path_prefix = emby_pref:get_text()
+    })
+    d:delete()
+  end
+  local function cancel() d:delete() end
+  d:add_button("Save", save, 2, 7, 1, 1)
+  d:add_button("Cancel", cancel, 3, 7, 1, 1)
+  d:show()
+end
+
+function adapter.show_status_dialog(lines)
+  local d = vlc.dialog(EXT_TITLE .. " — Status")
+  for idx, line in ipairs(lines) do
+    d:add_label(line, 1, idx, 4, 1)
+  end
+  local function ok() d:delete() end
+  d:add_button("OK", ok, 2, #lines + 1, 1, 1)
+  d:show()
+end
+
 -- URL encoding (VLC doesn't provide encode_uri_component)
+
 local function url_encode(s)
   if not s then return "" end
   return s:gsub("([^%w_%-%.%~])", function(c)
@@ -190,222 +394,53 @@ local function json_encode(v)
   end
 end
 
--- Config persistence via file in VLC config dir
-local function config_path()
-  local userdata = vlc.config.userdatadir()
-  if not userdata then return nil end
-  return userdata .. "/emby_play_sync.json"
-end
+-- Emby Client — Emby REST API calls behind a focused interface
 
-local function load_config()
-  local path = config_path()
-  if not path then
-    dmsg("no user data dir, cannot load config")
-    return
-  end
-  local f = vlc.io.open(path, "rb")
-  if not f then
-    dmsg("no config file at %s", path)
-    return
-  end
-  local data = f:read("*all")
-  f:close()
-  if data and data ~= "" then
-    local ok, parsed = pcall(json_decode, data)
-    if ok and parsed then
-      cfg.server_url = parsed.server_url or ""
-      cfg.api_key = parsed.api_key or ""
-      cfg.user_id = parsed.user_id or ""
-      cfg.local_path_prefix = parsed.local_path_prefix or ""
-      cfg.emby_path_prefix = parsed.emby_path_prefix or ""
-      dmsg("config loaded from %s", path)
-      return
-    end
-  end
-  dmsg("empty or invalid config file")
-end
+local emby = {}
 
-local function save_config()
-  local path = config_path()
-  if not path then
-    derr("no user data dir, cannot save config")
-    return
-  end
-  local ok, encoded = pcall(json_encode, cfg)
-  if not ok then
-    derr("failed to encode config")
-    return
-  end
-  local f = vlc.io.open(path, "wb")
-  if not f then
-    derr("cannot write config to %s", path)
-    return
-  end
-  f:write(encoded)
-  f:close()
-  dmsg("config saved to %s", path)
-end
-
--- HTTP client via vlc.net
-
-local function build_emby_url(path)
+local function emby_build_url(path)
   local base = cfg.server_url:gsub("/+$", "")
   return base .. path
 end
 
-local function parse_url(url)
-  local parsed = vlc.strings.url_parse(url)
-  local path = parsed["path"] or "/"
-  if parsed["option"] and parsed["option"] ~= "" then
-    path = path .. "?" .. parsed["option"]
-  end
-  return parsed["host"], parsed["port"] or "8096", path
-end
-
 local function emby_request(method, spath, body)
   if cfg.server_url == "" or cfg.api_key == "" then
-    dwarn("emby not configured yet")
+    adapter.warn("emby not configured yet")
     return nil
   end
-
-  local url = build_emby_url(spath)
-  local host, port, req_path = parse_url(url)
-  if not host then
-    derr("invalid emby server URL: %s", cfg.server_url)
-    return nil
-  end
-
-  port = tonumber(port) or 8096
-
-  local header_lines = {
-    method .. " " .. req_path .. " HTTP/1.0",
-    "Host: " .. host .. ":" .. port,
+  local url = emby_build_url(spath)
+  local headers = {
     "X-Emby-Token: " .. cfg.api_key,
     "X-Emby-Authorization: MediaBrowser Client=\"VLC Play Sync\", Device=\"VLC\", Version=\"" .. EXT_VERSION .. "\"",
     "Content-Type: application/json",
     "Accept: application/json",
   }
-  if body then
-    header_lines[#header_lines + 1] = "Content-Length: " .. #body
-  end
-  header_lines[#header_lines + 1] = ""
-  header_lines[#header_lines + 1] = ""
-
-  local request_str = table.concat(header_lines, "\r\n") .. (body or "")
-
-  local fd = vlc.net.connect_tcp(host, port)
-  if not fd then
-    derr("failed to connect to %s:%s", host, tostring(port))
+  local code, resp = adapter.http_request(method, url, headers, body)
+  if not code then
+    adapter.error("emby request failed: %s", tostring(resp))
     return nil
   end
-
-  vlc.net.send(fd, request_str)
-
-  local pollfds = {}
-  pollfds[fd] = vlc.net.POLLIN
-  vlc.net.poll(pollfds)
-
-  local raw = ""
-  local chunk = vlc.net.recv(fd, 4096)
-  while chunk do
-    raw = raw .. chunk
-    vlc.net.poll(pollfds)
-    chunk = vlc.net.recv(fd, 4096)
+  if code >= 400 then
+    adapter.error("emby error %s %s -> %d: %s", method, spath, code, tostring(resp))
   end
-  vlc.net.close(fd)
-
-  local header_end = raw:find("\r\n\r\n")
-  local body_start
-  if header_end then
-    body_start = header_end + 4
-  else
-    header_end, body_start = raw:find("\n\n")
-    if not header_end then
-      return nil
-    end
-    body_start = body_start + 1
-  end
-
-  local header_part = raw:sub(1, header_end - 1)
-  local body_part = raw:sub(body_start)
-
-  local status_line = header_part:match("HTTP/%d%.%d (%d+)")
-  local status_code = tonumber(status_line)
-
-  if not status_code then
-    return nil
-  end
-
-  -- follow redirect
-  if status_code == 301 or status_code == 302 or status_code == 307 then
-    local location = header_part:match("Location: ([^\r\n]+)")
-    if location then
-      local l_host, l_port, l_path = parse_url(location)
-      if l_host then
-        host, port, req_path = l_host, l_port or 8096, l_path
-        cfg.server_url = "http://" .. host .. ":" .. port
-        header_lines[1] = method .. " " .. req_path .. " HTTP/1.0"
-        header_lines[2] = "Host: " .. host .. ":" .. port
-        request_str = table.concat(header_lines, "\r\n") .. (body or "")
-        if fd then vlc.net.close(fd) end
-        fd = vlc.net.connect_tcp(host, port)
-        if not fd then return nil end
-        vlc.net.send(fd, request_str)
-        pollfds, raw = {}, ""
-        pollfds[fd] = vlc.net.POLLIN
-        vlc.net.poll(pollfds)
-        chunk = vlc.net.recv(fd, 4096)
-        while chunk do
-          raw = raw .. chunk
-          vlc.net.poll(pollfds)
-          chunk = vlc.net.recv(fd, 4096)
-        end
-        vlc.net.close(fd)
-        header_end = raw:find("\r\n\r\n")
-        if header_end then
-          body_start = header_end + 4
-        else
-          header_end, body_start = raw:find("\n\n")
-          if not header_end then return nil end
-          body_start = body_start + 1
-        end
-        header_part = raw:sub(1, header_end - 1)
-        body_part = raw:sub(body_start)
-        status_line = header_part:match("HTTP/%d%.%d (%d+)")
-        status_code = tonumber(status_line)
-      end
-    end
-  end
-
-  dmsg("emby %s %s -> %d (%d bytes)", method, spath, status_code or 0, #body_part)
-  if status_code and status_code >= 400 then
-    derr("emby error response: %s", body_part)
-  end
-  return status_code, body_part
+  adapter.debug("emby %s %s -> %d (%d bytes)", method, spath, code, #(resp or ""))
+  return code, resp
 end
 
--- Emby API helpers
-
-local function osd(msg)
-  pcall(vlc.osd.message, msg)
-end
-
-local function emby_path_for(filepath)
-  if cfg.local_path_prefix ~= "" and cfg.emby_path_prefix ~= "" then
-    local start = filepath:find(cfg.local_path_prefix, 1, true)
-    if start == 1 then
-      local suffix = filepath:sub(#cfg.local_path_prefix + 1)
-      local translated = cfg.emby_path_prefix .. suffix
-      dmsg("translated path: %s -> %s", filepath, translated)
-      return translated
+function emby.find_item_by_path(search_path)
+  local spath = "/emby/Items?UserId=" .. url_encode(cfg.user_id) .. "&Recursive=true&Path=" .. url_encode(search_path)
+  local code, resp = emby_request("GET", spath, nil)
+  if code and code >= 200 and code < 300 and resp then
+    local ok, data = pcall(json_decode, resp)
+    if ok and data and data.Items and #data.Items > 0 then
+      return data.Items[1]
     end
   end
-  return filepath
+  return nil
 end
 
-local function search_hints(term)
-  local encoded = url_encode(term)
-  local spath = "/emby/Search/Hints?UserId=" .. url_encode(cfg.user_id) .. "&SearchTerm=" .. encoded .. "&Limit=5&IncludeMedia=true"
+function emby.search_hints(term)
+  local spath = "/emby/Search/Hints?UserId=" .. url_encode(cfg.user_id) .. "&SearchTerm=" .. url_encode(term) .. "&Limit=5&IncludeMedia=true"
   local code, resp = emby_request("GET", spath, nil)
   if code and code >= 200 and code < 300 and resp then
     local ok, data = pcall(json_decode, resp)
@@ -416,240 +451,311 @@ local function search_hints(term)
   return nil
 end
 
-local function emby_find_item(filepath)
-  if cfg.user_id == "" then
-    dwarn("no user_id configured, cannot search for items")
-    osd("Emby: User ID not configured")
-    return nil
-  end
-
-  -- try exact path match via /Items endpoint (with prefix translation)
-  local search_path = emby_path_for(filepath)
-  local encoded = url_encode(search_path)
-  local spath = "/emby/Items?UserId=" .. url_encode(cfg.user_id) .. "&Recursive=true&Path=" .. encoded
-  local code, resp = emby_request("GET", spath, nil)
-  if code and code >= 200 and code < 300 and resp then
-    local ok, data = pcall(json_decode, resp)
-    if ok and data and data.Items and #data.Items > 0 then
-      dmsg("matched item by path: %s (%s)", data.Items[1].Name, data.Items[1].Id)
-      osd("Emby: matched " .. data.Items[1].Name)
-      return data.Items[1]
-    end
-  end
-
-  -- fallback: search hints by filename
-  local filename = filepath:match("[^/\\]+$")
-  if filename then
-    local names = { filename }
-    local no_ext = filename:gsub("%.[^%.]+$", "")
-    if no_ext ~= filename then names[#names + 1] = no_ext end
-    -- strip season/episode patterns like S2026E29
-    local clean = no_ext:gsub("[%s_%.]*[Ss]%d+[Ee]%d+", ""):gsub("^[%s%-_%.]+", ""):gsub("[%s%-_%.]+$", "")
-    if clean ~= no_ext and clean ~= "" then names[#names + 1] = clean end
-
-    for _, name in ipairs(names) do
-      local hints = search_hints(name)
-      if hints then
-        local hint = hints[1]
-        dmsg("matched item by filename '%s': %s (%s)", name, hint.Name, hint.ItemId)
-        osd("Emby: matched " .. hint.Name)
-        return { Id = hint.ItemId, Name = hint.Name }
-      end
-    end
-  end
-
-  dwarn("no emby item found for: %s", filepath)
-  osd("Emby: no match for this file")
-  return nil
-end
-
-local function generate_session_id()
-  local t = math.floor(os.time() * 1000000)
-  return string.format("vlc-%d-%d", t, math.random(10000, 99999))
-end
-
-local function get_position_ticks()
-  if vlc.object and vlc.object.input then
-    local input_obj = vlc.object.input()
-    if input_obj then
-      local time_us = vlc.var.get(input_obj, "time")
-      if time_us and time_us > 0 then
-        return math.floor(time_us * 10)
-      end
-    end
-  end
-  return 0
-end
-
-local function get_current_uri()
-  if vlc.input and vlc.input.item then
-    local item = vlc.input.item()
-    if item then
-      return item:uri()
-    end
-  end
-  return nil
-end
-
-local function get_playback_status()
-  if vlc.playlist and vlc.playlist.status then
-    local st = vlc.playlist.status()
-    if st and st ~= "" then return st end
-  end
-  if vlc.object and vlc.object.input then
-    local input_obj = vlc.object.input()
-    if input_obj then
-      local st = vlc.var.get(input_obj, "state")
-      if st == 3 then return "playing"
-      elseif st == 4 then return "paused" end
-    end
-  end
-  return ""
-end
-
-local function is_playing()
-  local st = get_playback_status()
-  return st == "playing"
-end
-
-local function get_local_path(uri)
-  if not uri then return nil end
-  -- only try to match local files
-  if uri:sub(1, 7) ~= "file://" then
-    return nil
-  end
-  local path = vlc.strings.make_path(uri)
-  if path and path ~= "" then
-    return path
-  end
-  return vlc.strings.decode_uri(uri:match("^file://(.+)$") or uri)
-end
-
-local function emby_save_position(ticks)
-  if not state.item_id or cfg.user_id == "" then return end
-  local payload = {
+function emby.save_position(item_id, ticks)
+  local payload = json_encode({
     PlaybackPositionTicks = ticks,
     Played = false
-  }
-  local spath = "/emby/Users/" .. url_encode(cfg.user_id) .. "/Items/" .. url_encode(state.item_id) .. "/UserData"
-  local code, resp = emby_request("POST", spath, json_encode(payload))
-  if code and code >= 200 and code < 300 then
-    dmsg("position saved: %d ticks", ticks)
-  else
-    dwarn("position save failed: %s body=%s", tostring(code), tostring(resp))
-  end
+  })
+  local spath = "/emby/Users/" .. url_encode(cfg.user_id) .. "/Items/" .. url_encode(item_id) .. "/UserData"
+  local code = emby_request("POST", spath, payload)
+  return code and code >= 200 and code < 300
 end
 
--- Emby session lifecycle
-
-local function emby_play_start(item)
-  if not item then return end
-  local ticks = get_position_ticks()
-  if not state.play_session_id then
-    state.play_session_id = generate_session_id()
-  end
-  local payload = {
-    ItemId = item.Id,
-    MediaSourceId = item.Id,
-    PositionTicks = ticks,
+function emby.start_session(item_id, position, session_id)
+  local payload = json_encode({
+    ItemId = item_id,
+    MediaSourceId = item_id,
+    PositionTicks = position,
     CanSeek = true,
     IsPaused = false,
     IsMuted = false,
     PlayMethod = "DirectPlay",
-    PlaySessionId = state.play_session_id
-  }
+    PlaySessionId = session_id
+  })
   local spath = "/emby/Sessions/Playing?userId=" .. url_encode(cfg.user_id)
-  local code, _ = emby_request("POST", spath, json_encode(payload))
-  if code and code >= 200 and code < 300 then
-    state.playing = true
-    state.last_sync = os.time()
-    dmsg("playback started: %s (%d ticks)", item.Name, ticks)
-  else
-    dwarn("play start failed: %s", tostring(code))
-  end
+  local code = emby_request("POST", spath, payload)
+  return code and code >= 200 and code < 300
 end
 
-local function emby_play_progress(event_name)
-  if not state.item_id then
-    dwarn("no item matched, skipping progress")
-    return
-  end
-  local ticks = get_position_ticks()
-  local payload = {
-    ItemId = state.item_id,
-    MediaSourceId = state.media_source_id or state.item_id,
-    PositionTicks = ticks,
+function emby.report_progress(item_id, media_source_id, position, session_id, event_name)
+  local payload = json_encode({
+    ItemId = item_id,
+    MediaSourceId = media_source_id,
+    PositionTicks = position,
     CanSeek = true,
     IsPaused = event_name == "Pause",
     IsMuted = false,
     PlayMethod = "DirectPlay",
-    PlaySessionId = state.play_session_id,
+    PlaySessionId = session_id,
     EventName = event_name
-  }
+  })
   local spath = "/emby/Sessions/Playing/Progress?userId=" .. url_encode(cfg.user_id)
-  local code, _ = emby_request("POST", spath, json_encode(payload))
-  if code and code >= 200 and code < 300 then
-    state.last_sync = os.time()
-    dmsg("progress: %s -> %d ticks", event_name, ticks)
+  local code = emby_request("POST", spath, payload)
+  return code and code >= 200 and code < 300
+end
+
+function emby.end_session(item_id, media_source_id, position, session_id)
+  local payload = json_encode({
+    ItemId = item_id,
+    MediaSourceId = media_source_id,
+    PositionTicks = position,
+    PlaySessionId = session_id,
+    Failed = false
+  })
+  local spath = "/emby/Sessions/Playing/Stopped?userId=" .. url_encode(cfg.user_id)
+  local code = emby_request("POST", spath, payload)
+  return code and code >= 200 and code < 300
+end
+
+function emby.list_users()
+  local code, resp = emby_request("GET", "/emby/Users", nil)
+  if code and code >= 200 and code < 300 and resp then
+    local ok, users = pcall(json_decode, resp)
+    if ok and type(users) == "table" then
+      return users
+    end
+  end
+  return nil
+end
+
+-- Media Matcher — matches file paths to Emby items
+
+local matcher = {}
+
+function matcher.translate_path(filepath)
+  if cfg.local_path_prefix ~= "" and cfg.emby_path_prefix ~= "" then
+    local start = filepath:find(cfg.local_path_prefix, 1, true)
+    if start == 1 then
+      local suffix = filepath:sub(#cfg.local_path_prefix + 1)
+      local translated = cfg.emby_path_prefix .. suffix
+      adapter.debug("translated path: %s -> %s", filepath, translated)
+      return translated
+    end
+  end
+  return filepath
+end
+
+function matcher.alternate_names(filename)
+  local names = { filename }
+  local no_ext = filename:gsub("%.[^%.]+$", "")
+  if no_ext ~= filename then names[#names + 1] = no_ext end
+  local clean = no_ext:gsub("[%s_%.]*[Ss]%d+[Ee]%d+", ""):gsub("^[%s%-_%.]+", ""):gsub("[%s%-_%.]+$", "")
+  if clean ~= no_ext and clean ~= "" then names[#names + 1] = clean end
+  return names
+end
+
+function matcher.match(filepath)
+  if cfg.user_id == "" then return nil end
+
+  local item = emby.find_item_by_path(matcher.translate_path(filepath))
+  if item then return item end
+
+  local filename = filepath:match("[^/\\]+$")
+  if filename then
+    for _, name in ipairs(matcher.alternate_names(filename)) do
+      local hints = emby.search_hints(name)
+      if hints and #hints > 0 then
+        return { Id = hints[1].ItemId, Name = hints[1].Name }
+      end
+    end
+  end
+
+  return nil
+end
+
+-- Playback Session — manages Emby session lifecycle
+
+local playback = {}
+
+local play_session_id = nil
+local play_active = false
+local play_item_id = nil
+local play_media_source_id = nil
+
+function playback.start(item_id, item_name)
+  if not item_id then return false end
+  play_item_id = item_id
+  play_media_source_id = item_id
+  local position = adapter.get_position_ticks()
+  if not play_session_id then
+    play_session_id = math.floor(os.time() * 1000000)
+    play_session_id = string.format("vlc-%d-%d", play_session_id, math.random(10000, 99999))
+  end
+  if emby.start_session(item_id, position, play_session_id) then
+    play_active = true
+    adapter.debug("playback started: %s (%d ticks)", item_name, position)
+    return true
+  end
+  adapter.warn("play start failed")
+  return false
+end
+
+function playback.progress(event_name)
+  if not play_item_id then
+    adapter.warn("no item, skipping progress")
+    return
+  end
+  local position = adapter.get_position_ticks()
+  if emby.report_progress(play_item_id, play_media_source_id, position, play_session_id, event_name) then
+    adapter.debug("progress: %s -> %d ticks", event_name, position)
     if event_name == "Pause" or event_name == "TimeUpdate" then
-      emby_save_position(ticks)
+      playback.save_position()
     end
   else
-    dwarn("progress failed: %s", tostring(code))
+    adapter.warn("progress failed: %s", event_name)
   end
 end
 
-local function emby_play_stop()
-  if not state.item_id then return end
-  local ticks = get_position_ticks()
-  local payload = {
-    ItemId = state.item_id,
-    MediaSourceId = state.media_source_id or state.item_id,
-    PositionTicks = ticks,
-    PlaySessionId = state.play_session_id,
-    Failed = false
-  }
-  local spath = "/emby/Sessions/Playing/Stopped?userId=" .. url_encode(cfg.user_id)
-  local code, _ = emby_request("POST", spath, json_encode(payload))
-  if code and code >= 200 and code < 300 then
-    dmsg("playback stopped at %d ticks", ticks)
-    emby_save_position(ticks)
+function playback.stop()
+  if not play_item_id then return end
+  local position = adapter.get_position_ticks()
+  if emby.end_session(play_item_id, play_media_source_id, position, play_session_id) then
+    adapter.debug("playback stopped at %d ticks", position)
+    playback.save_position()
   else
-    dwarn("stop failed: %s", tostring(code))
+    adapter.warn("stop failed")
   end
-  state.playing = false
-  state.play_session_id = nil
+  play_active = false
+  play_session_id = nil
+  play_item_id = nil
+  play_media_source_id = nil
 end
+
+function playback.save_position()
+  if not play_item_id then return end
+  local position = adapter.get_position_ticks()
+  if emby.save_position(play_item_id, position) then
+    adapter.debug("position saved: %d ticks", position)
+  else
+    adapter.warn("position save failed")
+  end
+end
+
+function playback.is_active()
+  return play_active
+end
+
+function playback.clear()
+  play_active = false
+  play_session_id = nil
+  play_item_id = nil
+  play_media_source_id = nil
+end
+
+-- Config — manages config persistence and user resolution
+
+local config = {}
+
+function config.load()
+  local path = adapter.config_path()
+  if not path then
+    adapter.debug("no user data dir, cannot load config")
+    return
+  end
+  local data = adapter.read_file(path)
+  if data == nil then
+    adapter.debug("no config file at %s", path)
+    return
+  end
+  if data == "" then
+    adapter.debug("empty config file, using defaults")
+    return
+  end
+  local ok, parsed = pcall(json_decode, data)
+  if ok and parsed then
+    cfg.server_url = parsed.server_url or ""
+    cfg.api_key = parsed.api_key or ""
+    cfg.user_id = parsed.user_id or ""
+    cfg.local_path_prefix = parsed.local_path_prefix or ""
+    cfg.emby_path_prefix = parsed.emby_path_prefix or ""
+    adapter.debug("config loaded from %s", path)
+  else
+    adapter.debug("invalid config file, using defaults")
+  end
+end
+
+function config.save()
+  local path = adapter.config_path()
+  if not path then
+    adapter.error("no user data dir, cannot save config")
+    return
+  end
+  local ok, encoded = pcall(json_encode, cfg)
+  if not ok then
+    adapter.error("failed to encode config")
+    return
+  end
+  if not adapter.write_file(path, encoded) then
+    adapter.error("cannot write config to %s", path)
+    return
+  end
+  adapter.debug("config saved to %s", path)
+end
+
+function config.update(t)
+  cfg.server_url = t.server_url or ""
+  cfg.api_key = t.api_key or ""
+  cfg.user_id = t.user_id or ""
+  cfg.local_path_prefix = t.local_path_prefix or ""
+  cfg.emby_path_prefix = t.emby_path_prefix or ""
+end
+
+function config.resolve_user()
+  if cfg.user_id == "" then return end
+  if cfg.user_id:match("^[%x%-]+$") and (#cfg.user_id == 32 or #cfg.user_id == 36) then return end
+  adapter.debug("resolving username '%s' to UUID via /Users", cfg.user_id)
+  local users = emby.list_users()
+  if users then
+    for _, user in ipairs(users) do
+      if user.Name == cfg.user_id then
+        cfg.user_id = user.Id
+        config.save()
+        adapter.debug("resolved user '%s' to UUID: %s", user.Name, user.Id)
+        return
+      end
+    end
+    adapter.warn("no user found with name '%s'", cfg.user_id)
+  else
+    adapter.warn("failed to fetch users, cannot resolve username")
+  end
+end
+
+
+-- Item matching
 
 local function match_and_cache()
-  local uri = get_current_uri()
+  local uri = adapter.get_current_uri()
   if not uri or uri == "" then
     state.item_matched = false
     return false
   end
 
   if uri:sub(1, 7) ~= "file://" then
-    dmsg("not a local file, skipping emby match: %s", uri)
+    adapter.debug("not a local file, skipping emby match: %s", uri)
     state.item_matched = false
     return false
   end
 
-  local path = get_local_path(uri)
+  local path = adapter.get_local_path(uri)
   if not path then
-    dwarn("could not get local path from URI: %s", uri)
+    adapter.warn("could not get local path from URI: %s", uri)
     state.item_matched = false
     return false
   end
 
-  dmsg("attempting to match: %s", path)
-  local item = emby_find_item(path)
+  adapter.debug("attempting to match: %s", path)
+  local item = matcher.match(path)
   if item then
+    adapter.debug("matched item: %s (%s)", item.Name, item.Id)
+    adapter.osd_message("Emby: matched " .. item.Name)
     state.item_id = item.Id
     state.media_source_id = item.Id
     state.item_matched = true
     return true
   end
 
+  adapter.warn("no emby item found for: %s", path)
+  adapter.osd_message("Emby: no match for this file")
   state.item_matched = false
   state.item_id = nil
   state.media_source_id = nil
@@ -659,10 +765,7 @@ end
 local function clear_state()
   state.item_id = nil
   state.media_source_id = nil
-  state.play_session_id = nil
   state.item_matched = false
-  state.playing = false
-  state.last_sync = 0
   state.last_status = ""
 end
 
@@ -679,75 +782,47 @@ function descriptor()
   }
 end
 
-local function resolve_user_id()
-  if cfg.user_id == "" then return end
-  -- already a UUID (32 hex chars or 36 with hyphens)
-  if cfg.user_id:match("^[%x%-]+$") and (#cfg.user_id == 32 or #cfg.user_id == 36) then
-    return
-  end
-  dmsg("resolving username '%s' to UUID via /Users", cfg.user_id)
-  local code, resp = emby_request("GET", "/emby/Users", nil)
-  if code and code >= 200 and code < 300 and resp then
-    local ok, users = pcall(json_decode, resp)
-    if ok and type(users) == "table" then
-      for _, user in ipairs(users) do
-        if user.Name == cfg.user_id then
-          cfg.user_id = user.Id
-          save_config()
-          dmsg("resolved user '%s' to UUID: %s", user.Name, user.Id)
-          return
-        end
-      end
-      dwarn("no user found with name '%s'", cfg.user_id)
-    end
-  else
-    dwarn("failed to fetch users, cannot resolve username")
-  end
-end
-
 function activate()
-  dmsg("activating extension v%s", EXT_VERSION)
+  adapter.debug("activating extension v%s", EXT_VERSION)
   math.randomseed(os.time())
-  load_config()
+  config.load()
 
   if cfg.server_url ~= "" then
-    dmsg("configured for: %s", cfg.server_url)
-    resolve_user_id()
+    adapter.debug("configured for: %s", cfg.server_url)
+    config.resolve_user()
   else
-    dwarn("no configuration found — use Configure menu to set up Emby server")
+    adapter.warn("no configuration found — use Configure menu to set up Emby server")
   end
 
-  if get_current_uri() then
+  if adapter.get_current_uri() then
     match_and_cache()
   end
 end
 
 function deactivate()
-  dmsg("deactivating")
-  if state.playing then
-    emby_play_stop()
-  end
+  adapter.debug("deactivating")
+  if playback.is_active() then playback.stop() end
+  playback.clear()
   clear_state()
 end
 
 function close()
-  dmsg("VLC closing")
-  if state.playing and state.item_matched then
-    emby_play_stop()
-  end
+  adapter.debug("VLC closing")
+  if playback.is_active() and state.item_matched then playback.stop() end
+  playback.clear()
   clear_state()
 end
 
 function input_changed()
-  local uri = get_current_uri()
+  local uri = adapter.get_current_uri()
   if not uri then
-    if state.playing then
-      emby_play_stop()
-    end
+    if playback.is_active() then playback.stop() end
+    playback.clear()
     clear_state()
     return
   end
 
+  playback.clear()
   clear_state()
   match_and_cache()
 end
@@ -755,28 +830,25 @@ end
 function meta_changed() end
 
 function playing_changed()
-  local st = get_playback_status()
-  dmsg("status changed: %s -> %s", state.last_status, st)
+  local st = adapter.get_playback_status()
+  adapter.debug("status changed: %s -> %s", state.last_status, st)
 
   if st == "playing" then
     if state.last_status == "paused" and state.item_matched then
-      emby_play_progress("Unpause")
-    elseif not state.playing and state.item_matched then
-      emby_play_start({ Id = state.item_id, Name = (get_current_uri() or ""):match("[^/\\]+$") or "unknown" })
+      playback.progress("Unpause")
+    elseif not playback.is_active() and state.item_matched then
+      playback.start(state.item_id, (adapter.get_current_uri() or ""):match("[^/\\]+$") or "unknown")
     end
-    state.playing = true
 
   elseif st == "paused" then
-    if state.playing and state.item_matched then
-      emby_play_progress("Pause")
+    if playback.is_active() then
+      playback.progress("Pause")
     end
-    state.playing = false
 
   elseif st == "stopped" or st == "" then
-    if state.playing and state.item_matched then
-      emby_play_stop()
+    if playback.is_active() then
+      playback.stop()
     end
-    state.playing = false
   end
 
   state.last_status = st
@@ -790,97 +862,36 @@ end
 
 function trigger_menu(id)
   if id == 1 then
-    if state.item_matched and state.play_session_id then
-      emby_play_progress("TimeUpdate")
-      dmsg("manual sync triggered")
+    if state.item_matched and playback.is_active() then
+      playback.progress("TimeUpdate")
+      adapter.debug("manual sync triggered")
     else
-      dwarn("manual sync skipped — no active session")
+      adapter.warn("manual sync skipped — no active session")
     end
   elseif id == 2 then
-    show_config_dialog()
+    adapter.show_config_dialog(cfg, function(new_cfg)
+      config.update(new_cfg)
+      config.save()
+      config.resolve_user()
+      adapter.debug("configuration saved and applied")
+    end)
   elseif id == 3 then
-    show_status()
+    local lines = {}
+    lines[#lines + 1] = "Server: " .. (cfg.server_url ~= "" and cfg.server_url or "not configured")
+    lines[#lines + 1] = "API Key: " .. (cfg.api_key ~= "" and "****" or "not set")
+    lines[#lines + 1] = "User ID: " .. (cfg.user_id ~= "" and cfg.user_id or "not set")
+    if cfg.local_path_prefix ~= "" then
+      lines[#lines + 1] = "Local prefix: " .. cfg.local_path_prefix
+      lines[#lines + 1] = "Emby prefix: " .. cfg.emby_path_prefix
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Item matched: " .. tostring(state.item_matched)
+    if state.item_id then
+      lines[#lines + 1] = "Emby ItemId: " .. state.item_id
+    end
+    lines[#lines + 1] = "Playing: " .. tostring(playback.is_active())
+    lines[#lines + 1] = "Last status: " .. state.last_status
+    lines[#lines + 1] = "Position ticks: " .. tostring(adapter.get_position_ticks())
+    adapter.show_status_dialog(lines)
   end
-end
-
-local dialog
-
-local function close_dialog()
-  if dialog then
-    dialog:delete()
-    dialog = nil
-  end
-end
-
-function show_config_dialog()
-  close_dialog()
-  dialog = vlc.dialog(EXT_TITLE .. " — Configuration")
-
-  dialog:add_label("Emby Server URL:", 1, 1, 1, 1)
-  local url_input = dialog:add_text_input(cfg.server_url, 2, 1, 3, 1)
-
-  dialog:add_label("API Key:", 1, 2, 1, 1)
-  local key_input = dialog:add_password(cfg.api_key, 2, 2, 3, 1)
-
-  dialog:add_label("User ID (name or UUID):", 1, 3, 1, 1)
-  local uid_input = dialog:add_text_input(cfg.user_id, 2, 3, 3, 1)
-
-  dialog:add_label("Local path prefix:", 1, 4, 1, 1)
-  local local_pref = dialog:add_text_input(cfg.local_path_prefix, 2, 4, 3, 1)
-
-  dialog:add_label("Emby path prefix:", 1, 5, 1, 1)
-  local emby_pref = dialog:add_text_input(cfg.emby_path_prefix, 2, 5, 3, 1)
-
-  dialog:add_label("", 1, 6, 4, 1)
-  local function save()
-    cfg.server_url = url_input:get_text()
-    cfg.api_key = key_input:get_text()
-    cfg.user_id = uid_input:get_text()
-    cfg.local_path_prefix = local_pref:get_text()
-    cfg.emby_path_prefix = emby_pref:get_text()
-    save_config()
-    resolve_user_id()
-    close_dialog()
-    dmsg("configuration saved and applied")
-  end
-
-  local function cancel()
-    close_dialog()
-  end
-
-  dialog:add_button("Save", save, 2, 7, 1, 1)
-  dialog:add_button("Cancel", cancel, 3, 7, 1, 1)
-  dialog:show()
-end
-
-function show_status()
-  close_dialog()
-  dialog = vlc.dialog(EXT_TITLE .. " — Status")
-
-  local lines = {}
-  lines[#lines + 1] = "Server: " .. (cfg.server_url ~= "" and cfg.server_url or "not configured")
-  lines[#lines + 1] = "API Key: " .. (cfg.api_key ~= "" and "****" or "not set")
-  lines[#lines + 1] = "User ID: " .. (cfg.user_id ~= "" and cfg.user_id or "not set")
-  if cfg.local_path_prefix ~= "" then
-    lines[#lines + 1] = "Local prefix: " .. cfg.local_path_prefix
-    lines[#lines + 1] = "Emby prefix: " .. cfg.emby_path_prefix
-  end
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "Item matched: " .. tostring(state.item_matched)
-  if state.item_id then
-    lines[#lines + 1] = "Emby ItemId: " .. state.item_id
-  end
-  lines[#lines + 1] = "Playing: " .. tostring(state.playing)
-  lines[#lines + 1] = "Last status: " .. state.last_status
-  lines[#lines + 1] = "Position ticks: " .. tostring(get_position_ticks())
-
-  for idx, line in ipairs(lines) do
-    dialog:add_label(line, 1, idx, 4, 1)
-  end
-
-  local function ok()
-    close_dialog()
-  end
-  dialog:add_button("OK", ok, 2, #lines + 1, 1, 1)
-  dialog:show()
 end

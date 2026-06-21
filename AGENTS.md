@@ -13,6 +13,24 @@ Single-file Lua extension (`emby-play-sync.lua`) using VLC's Lua extension API.
 | `emby-play-sync.lua` | Main VLC Lua extension — all logic in one file |
 | `install.sh` | Symlinks extension into VLC's extension directory |
 
+### VLC Adapter seam
+
+All `vlc.*` calls live in a single `adapter` table at the top of the file. The rest of the logic calls `adapter.*` methods and never touches `vlc.*` directly. This creates a **seam** — swap `adapter` for a test adapter to run the full extension logic without VLC.
+
+| Adapter method | Wraps | Returns |
+|----------------|-------|---------|
+| `debug/warn/error` | `vlc.msg.{dbg,warn,err}` | — |
+| `config_path` | `vlc.config.userdatadir()` | `path` or nil |
+| `read_file` / `write_file` | `vlc.io.open` | data / bool |
+| `http_request` | `vlc.net.{connect_tcp,send,recv,poll,close}` | `status, body, header` |
+| `get_current_uri` | `vlc.input.item():uri()` | `uri` or nil |
+| `get_position_ticks` | `vlc.object.input()` → `vlc.var.get("time")` | ticks (int) |
+| `get_playback_status` | `vlc.playlist.status()` + `vlc.var.get("state")` | `"playing"`/`"paused"`/`""` |
+| `get_local_path` | `vlc.strings.make_path()` / `decode_uri()` | path or nil |
+| `osd_message` | `vlc.osd.message` | — |
+| `show_config_dialog` | `vlc.dialog` (takes `cfg`, calls `on_save(new_cfg)`) | — |
+| `show_status_dialog` | `vlc.dialog` (takes lines table) | — |
+
 ### VLC Lua APIs used
 
 - `descriptor()` / `activate()` / `deactivate()` / `close()` — extension lifecycle
@@ -20,20 +38,20 @@ Single-file Lua extension (`emby-play-sync.lua`) using VLC's Lua extension API.
 - `playing_changed()` — fires on play/pause/stop → push position to Emby
 - `meta_changed()` — required stub (VLC probes for it)
 - `menu()` / `trigger_menu()` — "Sync Now", "Configure", "Status"
-- `vlc.net` — raw TCP HTTP requests to Emby REST API
-- `vlc.dialog` — configuration UI
-- `vlc.input` / `vlc.player` — get current position and media URI
 
-### Emby API calls
+### Emby Client seam
 
-| Trigger | Endpoint | Purpose |
-|---------|----------|---------|
-| Play starts | `POST /Sessions/Playing` | Start playback session |
-| Pause/resume | `POST /Sessions/Playing/Progress` | Report position + event name |
-| Stop / VLC close | `POST /Sessions/Playing/Stopped` | End playback session |
-| Users lookup | `GET /Users` | Resolve username to UUID |
-| Item by path | `GET /Items?UserId=&Recursive=true&Path=` | Find ItemId by file path |
-| Search hints | `GET /Search/Hints?UserId=&SearchTerm=&Limit=5` | Fallback filename search |
+All Emby REST API protocol lives in the `emby` table (after JSON helpers). It exposes methods that encapsulate URL building, payload encoding, and response parsing. Higher-level functions (session lifecycle, matching, user resolution) call these methods and never touch `emby_request` directly.
+
+| Emby method | Endpoint | Returns |
+|-------------|----------|---------|
+| `find_item_by_path(path)` | `GET /Items?UserId=&Recursive=true&Path=` | item or nil |
+| `search_hints(term)` | `GET /Search/Hints?UserId=&SearchTerm=&Limit=5` | hints or nil |
+| `save_position(item_id, ticks)` | `POST /Users/{uid}/Items/{iid}/UserData` | bool |
+| `start_session(item_id, pos, sid)` | `POST /Sessions/Playing` | bool |
+| `report_progress(item_id, msid, pos, sid, event)` | `POST /Sessions/Playing/Progress` | bool |
+| `end_session(item_id, msid, pos, sid)` | `POST /Sessions/Playing/Stopped` | bool |
+| `list_users()` | `GET /Users` | users or nil |
 
 Auth: `X-Emby-Token` header with API key (static key from Emby Admin).
 
@@ -47,14 +65,44 @@ Auth: `X-Emby-Token` header with API key (static key from Emby Admin).
 | `local_path_prefix` | VLC-side path prefix for media files (e.g. `/mnt/nas/`) |
 | `emby_path_prefix` | Emby-side path prefix (e.g. `/media/`) |
 
-### Media matching
+### Config Module
 
-1. Extract file URI from `vlc.input.item():uri()`
-2. Convert to local path via `vlc.strings.make_path()`
-3. Translate path prefix (`local_path_prefix` → `emby_path_prefix`)
-4. Query Emby: `GET /Items?UserId={uuid}&Recursive=true&Path={translated_path}`
-5. Fallback: `GET /Search/Hints` by filename (strips extension, then strips S##E## patterns)
-6. Cache ItemId and MediaSourceId for the session
+Config persistence and user resolution live in the `config` table. It owns reading/writing config JSON to disk, applying updates from the dialog, and resolving a username to a UUID.
+
+| Config method | Purpose |
+|---------------|---------|
+| `load()` | Read config JSON from disk into `cfg` table |
+| `save()` | Write `cfg` table as JSON to disk |
+| `update(t)` | Apply a config table to `cfg` (used by dialog save) |
+| `resolve_user()` | If `cfg.user_id` is a name (not UUID), resolve via `GET /Users` and persist UUID |
+
+`activate()` calls `config.load()` then `config.resolve_user()`. The dialog save handler in `trigger_menu` calls `config.update()` → `config.save()` → `config.resolve_user()`.
+
+### Media Matcher seam
+
+All path-to-item matching logic lives in the `matcher` table. It owns prefix translation, exact path search, filename fallback (with S##E## stripping), and the fallback chain policy — all behind `matcher.match(local_path)`.
+
+| Matcher method | Purpose |
+|----------------|---------|
+| `translate_path(path)` | Map `local_path_prefix` → `emby_path_prefix` |
+| `alternate_names(filename)` | Generate search variants (no ext, stripped S##E##) |
+| `match(path)` | Try exact path, fallback to filename variants |
+
+`match_and_cache()` calls `matcher.match(path)` and handles side effects (logging, OSD, state update).
+
+### Playback Session seam
+
+All session lifecycle logic lives in the `playback` table. It owns session ID generation, position polling, Emby session start/progress/stop, and position-saving policy — all behind a focused interface.
+
+| Playback method | Purpose |
+|-----------------|---------|
+| `start(item_id, name)` | Generate session ID, poll position, start Emby session |
+| `progress(event)` | Poll position, report to Emby, save on Pause/TimeUpdate |
+| `stop()` | End Emby session, save final position, clear session state |
+| `save_position()` | Poll position, write resume point to Emby |
+| `is_active()` | Whether a playback session is in progress |
+
+`playing_changed()` translates VLC status transitions into `playback.start/progress/stop` calls.
 
 ### Timing
 
