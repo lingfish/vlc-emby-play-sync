@@ -13,12 +13,9 @@ local cfg = {
 }
 
 local state = {
-  playing = false,
   item_id = nil,
   media_source_id = nil,
-  play_session_id = nil,
   item_matched = false,
-  last_sync = 0,
   last_status = ""
 }
 
@@ -566,6 +563,85 @@ function matcher.match(filepath)
   return nil
 end
 
+-- Playback Session — manages Emby session lifecycle
+
+local playback = {}
+
+local play_session_id = nil
+local play_active = false
+local play_item_id = nil
+local play_media_source_id = nil
+
+function playback.start(item_id, item_name)
+  if not item_id then return false end
+  play_item_id = item_id
+  play_media_source_id = item_id
+  local position = adapter.get_position_ticks()
+  if not play_session_id then
+    play_session_id = math.floor(os.time() * 1000000)
+    play_session_id = string.format("vlc-%d-%d", play_session_id, math.random(10000, 99999))
+  end
+  if emby.start_session(item_id, position, play_session_id) then
+    play_active = true
+    adapter.debug("playback started: %s (%d ticks)", item_name, position)
+    return true
+  end
+  adapter.warn("play start failed")
+  return false
+end
+
+function playback.progress(event_name)
+  if not play_item_id then
+    adapter.warn("no item, skipping progress")
+    return
+  end
+  local position = adapter.get_position_ticks()
+  if emby.report_progress(play_item_id, play_media_source_id, position, play_session_id, event_name) then
+    adapter.debug("progress: %s -> %d ticks", event_name, position)
+    if event_name == "Pause" or event_name == "TimeUpdate" then
+      playback.save_position()
+    end
+  else
+    adapter.warn("progress failed: %s", event_name)
+  end
+end
+
+function playback.stop()
+  if not play_item_id then return end
+  local position = adapter.get_position_ticks()
+  if emby.end_session(play_item_id, play_media_source_id, position, play_session_id) then
+    adapter.debug("playback stopped at %d ticks", position)
+    playback.save_position()
+  else
+    adapter.warn("stop failed")
+  end
+  play_active = false
+  play_session_id = nil
+  play_item_id = nil
+  play_media_source_id = nil
+end
+
+function playback.save_position()
+  if not play_item_id then return end
+  local position = adapter.get_position_ticks()
+  if emby.save_position(play_item_id, position) then
+    adapter.debug("position saved: %d ticks", position)
+  else
+    adapter.warn("position save failed")
+  end
+end
+
+function playback.is_active()
+  return play_active
+end
+
+function playback.clear()
+  play_active = false
+  play_session_id = nil
+  play_item_id = nil
+  play_media_source_id = nil
+end
+
 -- Config persistence
 
 local function load_config()
@@ -614,73 +690,7 @@ local function save_config()
   adapter.debug("config saved to %s", path)
 end
 
-local function generate_session_id()
-  local t = math.floor(os.time() * 1000000)
-  return string.format("vlc-%d-%d", t, math.random(10000, 99999))
-end
 
-local function is_playing()
-  local st = adapter.get_playback_status()
-  return st == "playing"
-end
-
--- Emby API: save position
-
-local function emby_save_position(ticks)
-  if not state.item_id or cfg.user_id == "" then return end
-  if emby.save_position(state.item_id, ticks) then
-    adapter.debug("position saved: %d ticks", ticks)
-  else
-    adapter.warn("position save failed")
-  end
-end
-
--- Emby session lifecycle
-
-local function emby_play_start(item)
-  if not item then return end
-  local ticks = adapter.get_position_ticks()
-  if not state.play_session_id then
-    state.play_session_id = generate_session_id()
-  end
-  if emby.start_session(item.Id, ticks, state.play_session_id) then
-    state.playing = true
-    state.last_sync = os.time()
-    adapter.debug("playback started: %s (%d ticks)", item.Name, ticks)
-  else
-    adapter.warn("play start failed")
-  end
-end
-
-local function emby_play_progress(event_name)
-  if not state.item_id then
-    adapter.warn("no item matched, skipping progress")
-    return
-  end
-  local ticks = adapter.get_position_ticks()
-  if emby.report_progress(state.item_id, state.media_source_id or state.item_id, ticks, state.play_session_id, event_name) then
-    state.last_sync = os.time()
-    adapter.debug("progress: %s -> %d ticks", event_name, ticks)
-    if event_name == "Pause" or event_name == "TimeUpdate" then
-      emby_save_position(ticks)
-    end
-  else
-    adapter.warn("progress failed: %s", event_name)
-  end
-end
-
-local function emby_play_stop()
-  if not state.item_id then return end
-  local ticks = adapter.get_position_ticks()
-  if emby.end_session(state.item_id, state.media_source_id or state.item_id, ticks, state.play_session_id) then
-    adapter.debug("playback stopped at %d ticks", ticks)
-    emby_save_position(ticks)
-  else
-    adapter.warn("stop failed")
-  end
-  state.playing = false
-  state.play_session_id = nil
-end
 
 -- Item matching
 
@@ -726,10 +736,7 @@ end
 local function clear_state()
   state.item_id = nil
   state.media_source_id = nil
-  state.play_session_id = nil
   state.item_matched = false
-  state.playing = false
-  state.last_sync = 0
   state.last_status = ""
 end
 
@@ -787,30 +794,28 @@ end
 
 function deactivate()
   adapter.debug("deactivating")
-  if state.playing then
-    emby_play_stop()
-  end
+  if playback.is_active() then playback.stop() end
+  playback.clear()
   clear_state()
 end
 
 function close()
   adapter.debug("VLC closing")
-  if state.playing and state.item_matched then
-    emby_play_stop()
-  end
+  if playback.is_active() and state.item_matched then playback.stop() end
+  playback.clear()
   clear_state()
 end
 
 function input_changed()
   local uri = adapter.get_current_uri()
   if not uri then
-    if state.playing then
-      emby_play_stop()
-    end
+    if playback.is_active() then playback.stop() end
+    playback.clear()
     clear_state()
     return
   end
 
+  playback.clear()
   clear_state()
   match_and_cache()
 end
@@ -823,23 +828,20 @@ function playing_changed()
 
   if st == "playing" then
     if state.last_status == "paused" and state.item_matched then
-      emby_play_progress("Unpause")
-    elseif not state.playing and state.item_matched then
-      emby_play_start({ Id = state.item_id, Name = (adapter.get_current_uri() or ""):match("[^/\\]+$") or "unknown" })
+      playback.progress("Unpause")
+    elseif not playback.is_active() and state.item_matched then
+      playback.start(state.item_id, (adapter.get_current_uri() or ""):match("[^/\\]+$") or "unknown")
     end
-    state.playing = true
 
   elseif st == "paused" then
-    if state.playing and state.item_matched then
-      emby_play_progress("Pause")
+    if playback.is_active() then
+      playback.progress("Pause")
     end
-    state.playing = false
 
   elseif st == "stopped" or st == "" then
-    if state.playing and state.item_matched then
-      emby_play_stop()
+    if playback.is_active() then
+      playback.stop()
     end
-    state.playing = false
   end
 
   state.last_status = st
@@ -853,8 +855,8 @@ end
 
 function trigger_menu(id)
   if id == 1 then
-    if state.item_matched and state.play_session_id then
-      emby_play_progress("TimeUpdate")
+    if state.item_matched and playback.is_active() then
+      playback.progress("TimeUpdate")
       adapter.debug("manual sync triggered")
     else
       adapter.warn("manual sync skipped — no active session")
@@ -884,7 +886,7 @@ function trigger_menu(id)
     if state.item_id then
       lines[#lines + 1] = "Emby ItemId: " .. state.item_id
     end
-    lines[#lines + 1] = "Playing: " .. tostring(state.playing)
+    lines[#lines + 1] = "Playing: " .. tostring(playback.is_active())
     lines[#lines + 1] = "Last status: " .. state.last_status
     lines[#lines + 1] = "Position ticks: " .. tostring(adapter.get_position_ticks())
     adapter.show_status_dialog(lines)

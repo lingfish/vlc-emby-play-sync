@@ -77,6 +77,20 @@ All path-to-item matching logic lives in the `matcher` table. It owns prefix tra
 
 `match_and_cache()` calls `matcher.match(path)` and handles side effects (logging, OSD, state update).
 
+### Playback Session seam
+
+All session lifecycle logic lives in the `playback` table. It owns session ID generation, position polling, Emby session start/progress/stop, and position-saving policy — all behind a focused interface.
+
+| Playback method | Purpose |
+|-----------------|---------|
+| `start(item_id, name)` | Generate session ID, poll position, start Emby session |
+| `progress(event)` | Poll position, report to Emby, save on Pause/TimeUpdate |
+| `stop()` | End Emby session, save final position, clear session state |
+| `save_position()` | Poll position, write resume point to Emby |
+| `is_active()` | Whether a playback session is in progress |
+
+`playing_changed()` translates VLC status transitions into `playback.start/progress/stop` calls.
+
 ### Timing
 
 - Event-driven only (no timers — VLC Lua extension API doesn't support them)
