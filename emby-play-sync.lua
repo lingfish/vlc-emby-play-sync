@@ -2,7 +2,7 @@
 -- Syncs current playback position to Emby server as a resume point.
 
 local EXT_TITLE = "Emby Play Sync"
-local EXT_VERSION = "1.1"
+local EXT_VERSION = "1.2"
 
 local cfg = {
   server_url = "",
@@ -170,6 +170,18 @@ function adapter.get_position_ticks()
   return 0
 end
 
+function adapter.set_position_ticks(ticks)
+  if vlc.object and vlc.object.input then
+    local input_obj = vlc.object.input()
+    if input_obj then
+      local time_us = math.floor(ticks / 10)
+      vlc.var.set(input_obj, "time", time_us)
+      return true
+    end
+  end
+  return false
+end
+
 function adapter.get_playback_status()
   if vlc.playlist and vlc.playlist.status then
     local st = vlc.playlist.status()
@@ -234,6 +246,16 @@ function adapter.show_status_dialog(lines)
   end
   local function ok() d:delete() end
   d:add_button("OK", ok, 2, #lines + 1, 1, 1)
+  d:show()
+end
+
+function adapter.show_confirm_dialog(title, message, yes_text, no_text, on_yes, on_no)
+  local d = vlc.dialog(EXT_TITLE .. " — " .. title)
+  d:add_label(message, 1, 1, 4, 1)
+  local function yes_fn() d:delete(); on_yes() end
+  local function no_fn() d:delete(); on_no() end
+  d:add_button(yes_text, yes_fn, 1, 2, 1, 1)
+  d:add_button(no_text, no_fn, 3, 2, 1, 1)
   d:show()
 end
 
@@ -394,6 +416,17 @@ local function json_encode(v)
   end
 end
 
+local function format_ticks(ticks)
+  local secs = math.floor(ticks / 10000000)
+  local h = math.floor(secs / 3600)
+  local m = math.floor((secs % 3600) / 60)
+  local s = secs % 60
+  if h > 0 then
+    return string.format("%d:%02d:%02d", h, m, s)
+  end
+  return string.format("%d:%02d", m, s)
+end
+
 -- Emby Client — Emby REST API calls behind a focused interface
 
 local emby = {}
@@ -518,6 +551,22 @@ function emby.list_users()
   return nil
 end
 
+function emby.get_playback_position(item_id)
+  if not item_id then return 0 end
+  local spath = "/emby/Users/" .. url_encode(cfg.user_id) .. "/Items/" .. url_encode(item_id)
+  local code, resp = emby_request("GET", spath, nil)
+  if code and code >= 200 and code < 300 and resp then
+    local ok, data = pcall(json_decode, resp)
+    if ok and data and data.UserData then
+      local ticks = data.UserData.PlaybackPositionTicks
+      if ticks and ticks > 0 then
+        return ticks
+      end
+    end
+  end
+  return 0
+end
+
 -- Media Matcher — matches file paths to Emby items
 
 local matcher = {}
@@ -572,11 +621,11 @@ local play_active = false
 local play_item_id = nil
 local play_media_source_id = nil
 
-function playback.start(item_id, item_name)
+function playback.start(item_id, item_name, start_position)
   if not item_id then return false end
   play_item_id = item_id
   play_media_source_id = item_id
-  local position = adapter.get_position_ticks()
+  local position = start_position or adapter.get_position_ticks()
   if not play_session_id then
     play_session_id = math.floor(os.time() * 1000000)
     play_session_id = string.format("vlc-%d-%d", play_session_id, math.random(10000, 99999))
@@ -837,7 +886,28 @@ function playing_changed()
     if state.last_status == "paused" and state.item_matched then
       playback.progress("Unpause")
     elseif not playback.is_active() and state.item_matched then
-      playback.start(state.item_id, (adapter.get_current_uri() or ""):match("[^/\\]+$") or "unknown")
+      local item_name = (adapter.get_current_uri() or ""):match("[^/\\]+$") or "unknown"
+      local emby_pos = emby.get_playback_position(state.item_id)
+      local vlc_pos = adapter.get_position_ticks()
+      if emby_pos > vlc_pos + 50000000 and emby_pos > 100000000 then
+        adapter.show_confirm_dialog(
+          "Resume Position",
+          "Emby has a saved position at " .. format_ticks(emby_pos) .. ". Resume from there?",
+          "Resume",
+          "Start Over",
+          function()
+            adapter.set_position_ticks(emby_pos)
+            adapter.osd_message("Emby: Resumed at " .. format_ticks(emby_pos))
+            playback.start(state.item_id, item_name, emby_pos)
+          end,
+          function()
+            playback.start(state.item_id, item_name)
+          end
+        )
+        state.last_status = st
+        return
+      end
+      playback.start(state.item_id, item_name)
     end
 
   elseif st == "paused" then
